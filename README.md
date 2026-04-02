@@ -1,123 +1,160 @@
 # Are.na Bridge
 
-Plugin de Obsidian para conectar tu vault con [Are.na](https://www.are.na). Importa canales y bloques, publica notas y mantén sincronizado tu contenido.
+An Obsidian plugin that connects your vault with [Are.na](https://www.are.na). It lets you import channels and blocks, publish notes to Are.na, and keep a lightweight sync flow between both sides.
 
-## Origen y atribución
+## Features
 
-Este proyecto es una continuación independiente basada en la versión 1 de [`javierarce/arena-manager`](https://github.com/javierarce/arena-manager), publicada bajo licencia MIT.
+- Import blocks from an Are.na channel into your vault.
+- Import a single block by ID or URL.
+- Browse your Are.na channels from Obsidian with local cache and paginated loading.
+- Pull an Obsidian note from its original Are.na block.
+- Push a new or existing note to an Are.na channel.
+- Create new Are.na channels without leaving Obsidian.
+- Upload an Obsidian folder as a new Are.na channel.
+- Optionally download images and attachments into the vault.
 
-Mantiene el crédito al proyecto original, pero este repositorio no pretende seguir su upstream como fork activo. La implementación actual se ha adaptado al flujo moderno con Personal Access Token y a la API `v3` de Are.na.
+## Status
 
-## Instalación
+Current version: `2.0.0`
 
-1. Copia `main.js` y `manifest.json` en `.obsidian/plugins/arena-bridge/` dentro de tu vault.
-2. En Obsidian: **Ajustes → Plugins de la comunidad → Activar** "Are.na Bridge".
-3. Ve a los ajustes del plugin y configura:
-   - **Personal Access Token** — obtenlo en [are.na/settings/oauth](https://www.are.na/settings/oauth). Para publicar, actualizar bloques o crear canales necesitas scope `write`
-   - **Usuario (slug)** — tu slug de Are.na, por ejemplo `marco-noris`
-   - **Carpeta** — carpeta del vault donde se guardarán los bloques (por defecto `arena`)
-   - **Carpeta de adjuntos** — nombre de la subcarpeta local para imágenes y adjuntos descargados (por defecto `_assets`)
-   - **Diagnóstico de caché** — muestra cuántas respuestas API y canales locales tiene en memoria persistida, y permite vaciar caché de canales, de bloques o todo
+This version uses the Are.na `v3` API with a Personal Access Token.
 
-## Desarrollo
+This project independently continues the original idea behind [`javierarce/arena-manager`](https://github.com/javierarce/arena-manager), released under the MIT license. It is not intended to track that upstream as an active fork.
 
-El runtime que carga Obsidian sigue siendo `main.js`, pero el código fuente modular vive en `src/`.
+## Installation
 
-Si tienes Node.js instalado:
+Installation is currently manual:
 
-1. Ejecuta `npm install`
-2. Ejecuta `npm run build` para regenerar `main.js`
-3. Ejecuta `npm run dev` para rebuild automático mientras editas `src/`
+1. Copy `manifest.json` and `main.js` into `.obsidian/plugins/arena-bridge/` inside your vault.
+2. Restart Obsidian or reload community plugins.
+3. Enable `Are.na Bridge` in `Settings -> Community plugins`.
 
-`main.js` es el artefacto generado. Edita `src/`, no el bundle, salvo que estés haciendo una reparación urgente dentro del vault. Los archivos fuente válidos viven solo en `src/`.
+## Configuration
 
-## Comandos
+Configure the plugin in Obsidian settings:
 
-### Explorar mis canales
-Abre un modal con tus canales de Are.na. Puedes filtrarlos por nombre y seleccionar uno para importarlo al vault.
+- `Personal Access Token`: get it from [are.na/settings/oauth](https://www.are.na/settings/oauth). For channel creation and note push, use a token with `write` scope.
+- `Username (slug)`: your Are.na username, for example `marco-noris`.
+- `Folder`: base vault folder where imported blocks will be stored. Default: `arena`.
+- `Download attachments`: when enabled, images and files are downloaded into the vault.
+- `Attachments folder`: local subfolder name for downloaded files. Default: `_assets`.
 
-La primera vez tarda unos segundos en cargar la lista. El modal abre con un primer tramo de 12 canales y permite seguir cargando más desde ahí mismo si no aparece el que buscas. A partir de entonces reutiliza una caché local revalidada con `ETag`, de modo que solo vuelve a descargar las páginas que Are.na indica que cambiaron. Si creas canales nuevos en Are.na, puedes refrescar la lista desde el propio modal o usando **Actualizar lista de canales**.
+The settings panel also includes cache diagnostics and buttons to clear channel cache, block cache, or the full persisted cache state.
 
-### Obtener bloques de un canal
-Importa bloques de un canal a partir de su slug o URL. Empieza por la primera página y, si el canal tiene más contenido, te pide confirmación antes de seguir. Por ejemplo:
+## Usage
+
+### Browse My Channels
+
+Opens a modal listing your Are.na channels. Loading is paginated and backed by a local cache revalidated with `ETag`, so repeated browsing does not re-fetch everything unnecessarily.
+
+### Get Blocks From a Channel
+
+Accepts either a channel slug or a full channel URL, for example:
+
+```text
+my-channel
+https://www.are.na/marco-noris/my-channel
 ```
-mi-canal
-https://www.are.na/marco-noris/mi-canal
+
+The plugin imports the first page and asks for confirmation before loading more pages.
+
+### Get Block by ID or URL
+
+Imports a single block from Are.na.
+
+### Update Note From Are.na (Pull)
+
+If the active note has `blockid` in frontmatter, the plugin refreshes its content from Are.na without overwriting unrelated custom frontmatter keys.
+
+### Send Note to Are.na (Push)
+
+If the note already has `blockid`, the existing Are.na block is updated. Otherwise, the plugin lets you choose a channel and creates a new block.
+
+### Create Channel in Are.na
+
+Creates a new channel from Obsidian with one of these visibility modes:
+
+- `public`
+- `closed`
+- `private`
+
+### Upload Folder as Are.na Channel
+
+From the context menu of a vault folder, create a new Are.na channel and upload its `.md` notes as text blocks.
+
+- Notes that already have `blockid` are updated instead of duplicated.
+- New notes receive `blockid` and `channel` in frontmatter.
+
+### Open Block in Are.na
+
+Opens the Are.na block associated with the active note in your browser.
+
+## How Notes Are Stored
+
+Imported blocks are stored under:
+
+```text
+{configured-folder}/{channel-slug}/
 ```
 
-### Obtener bloque por ID o URL
-Importa un bloque concreto por su ID numérico o URL de Are.na.
-
-### Actualizar nota desde Are.na (Pull)
-Con una nota abierta que tenga `blockid` en el frontmatter, actualiza su contenido desde el bloque original en Are.na.
-Las claves personalizadas que ya tengas en el frontmatter se conservan; el plugin solo actualiza los campos que gestiona de Are.na.
-
-### Enviar nota a Are.na (Push)
-Publica la nota activa en Are.na. Si ya tiene `blockid`, actualiza el bloque existente. Si no, abre un selector con tus canales de Are.na y crea un bloque nuevo; si lo prefieres, también puedes introducir el slug manualmente.
-
-### Abrir bloque en Are.na
-Abre en el navegador el bloque de Are.na correspondiente a la nota activa.
-
-### Crear canal en Are.na
-Abre un formulario para crear un canal nuevo directamente desde Obsidian. Puedes definir el nombre y la visibilidad:
-- **Público** — cualquiera puede ver y añadir bloques
-- **Cerrado** — cualquiera puede ver, pero solo tú (y colaboradores) podéis añadir
-- **Privado** — solo tú y colaboradores podéis ver y añadir
-
-El canal nuevo aparece automáticamente en "Explorar mis canales" sin necesidad de refrescar.
-
-### Subir carpeta como canal a Are.na
-Haz clic derecho en cualquier carpeta del vault y selecciona "Subir carpeta como canal a Are.na". Se abrirá el formulario de creación de canal (con el nombre de la carpeta como sugerencia) y, al confirmar, subirá todas las notas `.md` de esa carpeta como bloques de texto en el canal nuevo.
-
-- Si una nota ya tiene `blockid` en el frontmatter, actualiza el bloque existente en lugar de duplicarlo.
-- Las notas nuevas reciben `blockid` y `channel` en su frontmatter automáticamente.
-
-### Actualizar lista de canales (refresco)
-Borra la caché local de canales para forzar una nueva descarga en el próximo "Explorar mis canales".
-
-## Estructura de las notas importadas
-
-Cada bloque se guarda como una nota `.md` con frontmatter:
+Each imported note includes frontmatter similar to this:
 
 ```yaml
 ---
 blockid: 12345
 class: Text
-title: "Título del bloque"
+title: "Block Title"
 user: marco-noris
-channel: nombre-del-canal
+channel: my-channel
 created_at: 2024-01-01
 updated_at: 2024-03-01
 ---
-
-Contenido del bloque...
 ```
 
-Los bloques se guardan en `{carpeta}/{slug-del-canal}/`. El `blockid` en el frontmatter es lo que permite hacer Pull y Push posteriores.
+Important details:
 
-Cuando una nota ya existe, el plugin la localiza primero por `blockid` y no por título de archivo. Así evita duplicados si el bloque cambia de nombre en Are.na o si ya has renombrado la nota en Obsidian. El plugin no reconstruye el frontmatter desde cero: mantiene tus claves personalizadas y solo fusiona/actualiza los metadatos propios de Are.na.
+- `blockid` is the reference used for future pull and push operations.
+- Existing notes are matched by `blockid`, not by filename.
+- Non-Are.na frontmatter keys are preserved.
+- If a note has `arena_skip_sync: true`, it is excluded from pull, push, and folder upload operations.
 
-Si una nota tiene este flag en el frontmatter, el plugin la excluye de Pull, Push y de "Subir carpeta como canal":
+## Supported Block Types
 
-```yaml
-arena_skip_sync: true
+| Type | Import behavior |
+| --- | --- |
+| Text | Markdown content |
+| Link | Link with title and description |
+| Image | Embedded image |
+| Attachment | Link or downloaded local file |
+| Media | Textual content when available |
+
+## Limits and Behavior
+
+- The plugin uses the Are.na `v3` API and only accesses content visible to your token.
+- It paces requests and retries automatically when Are.na returns `429`.
+- Channel browsing and some imports are intentionally paginated instead of bulk-loading everything.
+- If attachment download is enabled, the plugin enforces a per-run cap to avoid systematic downloading.
+- Are.na forbids scraping and bulk harvesting; this plugin is designed for interactive use inside Obsidian.
+
+## Development
+
+Obsidian loads `main.js`, but the source code lives in `src/`.
+
+```bash
+npm install
+npm run build
 ```
 
-## Tipos de bloque soportados
+For watch mode during development:
 
-| Tipo | Cómo se importa |
-|---|---|
-| Text | Contenido como texto Markdown |
-| Link | Enlace con título y descripción |
-| Image | Imagen embebida con `![]()` |
-| Attachment | Enlace al archivo adjunto |
-| Media | Contenido textual si existe |
+```bash
+npm run dev
+```
 
-## Notas
+Edit `src/`. `main.js` is the generated bundle.
 
-- El plugin usa la API v3 de Are.na con tu token personal, por lo que solo accede a contenido al que tienes acceso en Are.na.
-- El cliente añade una pausa corta entre peticiones secuenciales y, si Are.na responde con `429`, espera hasta la ventana de reset antes de reintentar.
-- Las respuestas `GET` cacheadas se revalidan con `If-None-Match` y `ETag`; el plugin solo reutiliza el cuerpo local cuando Are.na responde `304 Not Modified`.
-- Las cargas paginadas no recorren todas las páginas automáticamente: tras cada página adicional el plugin pide confirmación, y se detiene tras varias páginas para evitar extracción masiva.
-- Si activas **Descargar adjuntos**, las imágenes y adjuntos se guardan dentro del vault en la subcarpeta configurada junto a las notas importadas, y el Markdown pasa a enlazar al archivo local. En una misma ejecución solo se descargan un número limitado de adjuntos; el resto queda enlazado en remoto para evitar descargas masivas.
-- La documentación de Are.na prohíbe scraping, crawling automatizado y descargas masivas o sistemáticas. Si necesitas sincronizaciones muy grandes o bulk export, conviene pedir permiso a Are.na antes de usar el plugin con ese volumen.
+Additional API and implementation notes are documented in [`docs/arena-api-notes.md`](docs/arena-api-notes.md).
+
+## License
+
+MIT. See [LICENSE](./LICENSE).
