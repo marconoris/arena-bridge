@@ -1,0 +1,13 @@
+{
+  "name": "arena-bridge",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Build setup for the Are.na Bridge Obsidian plugin",
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "dev": "node esbuild.config.mjs --watch"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.2"
+  }
+}
