@@ -1,0 +1,102 @@
+.arena-bridge-modal {
+  width: 100%;
+}
+
+.arena-bridge-modal h2 {
+  margin: 0 0 12px;
+}
+
+.arena-bridge-modal input,
+.arena-bridge-modal select {
+  box-sizing: border-box;
+}
+
+.arena-bridge-modal__message {
+  margin: 0 0 16px;
+  line-height: 1.5;
+  color: var(--text-normal);
+}
+
+.arena-bridge-modal__input {
+  width: 100%;
+  margin: 8px 0 16px;
+  padding: 8px;
+  font-size: 14px;
+}
+
+.arena-bridge-modal__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.arena-bridge-channel-select__actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 8px 0 12px;
+}
+
+.arena-bridge-channel-select__message,
+.arena-bridge-channel-select__summary {
+  margin: -4px 0 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.arena-bridge-channel-select__list {
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.arena-bridge-channel-select__item {
+  margin-bottom: 2px;
+  padding: 8px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.arena-bridge-channel-select__item strong {
+  display: block;
+  line-height: 1.35;
+}
+
+.arena-bridge-channel-select__item:hover {
+  background: var(--background-modifier-hover);
+}
+
+.arena-bridge-channel-select__meta {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 768px) {
+  .arena-bridge-modal__input {
+    font-size: 16px;
+  }
+
+  .arena-bridge-modal__actions,
+  .arena-bridge-channel-select__actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .arena-bridge-modal__actions button,
+  .arena-bridge-channel-select__actions button {
+    width: 100%;
+  }
+
+  .arena-bridge-channel-select__list {
+    max-height: 40vh;
+  }
+
+  .arena-bridge-channel-select__item {
+    padding: 10px 12px;
+  }
+}

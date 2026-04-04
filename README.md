@@ -2,6 +2,8 @@
 
 An Obsidian plugin that connects your vault with [Are.na](https://www.are.na). It lets you import channels and blocks, publish notes to Are.na, and keep a lightweight sync flow between both sides.
 
+> Beta note: mobile support is currently beta. Core flows work, but the mobile UI is still being validated and may have rough edges.
+
 ## Features
 
 - Import blocks from an Are.na channel into your vault.
@@ -15,7 +17,7 @@ An Obsidian plugin that connects your vault with [Are.na](https://www.are.na). I
 
 ## Status
 
-Current version: `2.0.0`
+Current version: `1.0.1-beta.1`
 
 This version uses the Are.na `v3` API with a Personal Access Token.
 
@@ -26,8 +28,11 @@ This project independently continues the original idea behind [`javierarce/arena
 Installation is currently manual:
 
 1. Copy `manifest.json` and `main.js` into `.obsidian/plugins/arena-bridge/` inside your vault.
-2. Restart Obsidian or reload community plugins.
-3. Enable `Are.na Bridge` in `Settings -> Community plugins`.
+2. If present, also copy `styles.css` into `.obsidian/plugins/arena-bridge/`.
+3. Restart Obsidian or reload community plugins.
+4. Enable `Are.na Bridge` in `Settings -> Community plugins`.
+
+For public GitHub releases, publish beta builds as GitHub `Pre-release` versions until the mobile flow is fully validated.
 
 ## Configuration
 
@@ -36,10 +41,15 @@ Configure the plugin in Obsidian settings:
 - `Personal Access Token`: get it from [are.na/settings/oauth](https://www.are.na/settings/oauth). For channel creation and note push, use a token with `write` scope.
 - `Username (slug)`: your Are.na username, for example `marco-noris`.
 - `Folder`: base vault folder where imported blocks will be stored. Default: `arena`.
-- `Download attachments`: when enabled, images and files are downloaded into the vault.
+- The plugin remembers the last resolved folder for each Are.na channel and reuses it on later syncs.
+- `Download attachments`: when enabled, only allowed attachment types are downloaded into the vault. Unsupported or ambiguous types stay linked remotely.
 - `Attachments folder`: local subfolder name for downloaded files. Default: `_assets`.
+- `Skip code block languages on publish`: comma-separated list of fenced code block languages to strip before sending Markdown to Are.na. Example: `dataview, mermaid`.
+- `Skip callouts on publish`: removes Obsidian callout blocks like `> [!note]` before sending Markdown to Are.na.
 
 The settings panel also includes cache diagnostics and buttons to clear channel cache, block cache, or the full persisted cache state.
+
+> TODO: Revisit the publish-filter flow for `Pull` and channel re-import. The current safe behavior is to avoid overwriting local notes when they contain Markdown that is excluded from publishing, but a future version may need a proper merge strategy for local-only sections.
 
 ## Usage
 
@@ -115,6 +125,7 @@ Important details:
 
 - `blockid` is the reference used for future pull and push operations.
 - Existing notes are matched by `blockid`, not by filename.
+- If you move imported channel notes to another folder inside the vault, future channel syncs will prefer that new location.
 - Non-Are.na frontmatter keys are preserved.
 - If a note has `arena_skip_sync: true`, it is excluded from pull, push, and folder upload operations.
 
@@ -133,7 +144,7 @@ Important details:
 - The plugin uses the Are.na `v3` API and only accesses content visible to your token.
 - It paces requests and retries automatically when Are.na returns `429`.
 - Channel browsing and some imports are intentionally paginated instead of bulk-loading everything.
-- If attachment download is enabled, the plugin enforces a per-run cap to avoid systematic downloading.
+- If attachment download is enabled, the plugin enforces a per-run cap and only saves allowed MIME/extension types to avoid pulling unexpected files into the vault.
 - Are.na forbids scraping and bulk harvesting; this plugin is designed for interactive use inside Obsidian.
 
 ## Development
@@ -154,6 +165,8 @@ npm run dev
 Edit `src/`. `main.js` is the generated bundle.
 
 Additional API and implementation notes are documented in [`docs/arena-api-notes.md`](docs/arena-api-notes.md).
+
+Public launch preparation is tracked in [`docs/release-checklist.md`](docs/release-checklist.md).
 
 ## License
 

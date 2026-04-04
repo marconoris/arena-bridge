@@ -18,6 +18,46 @@ var require_constants = __commonJS({
     var ARENA_MAX_PAGES_PER_RUN = 10;
     var ARENA_MAX_ASSET_DOWNLOADS_PER_RUN = 20;
     var ARENA_RESPONSE_CACHE_LIMIT = 25;
+    var ALLOWED_ATTACHMENT_MIME_TYPES = [
+      "image/jpeg",
+      "image/jpg",
+      "image/png",
+      "image/gif",
+      "image/webp",
+      "application/pdf",
+      "application/epub+zip",
+      "text/plain",
+      "text/markdown",
+      "audio/mpeg",
+      "audio/mp4",
+      "audio/x-m4a",
+      "audio/wav",
+      "audio/x-wav",
+      "audio/webm",
+      "audio/ogg",
+      "video/mp4",
+      "video/quicktime",
+      "video/webm",
+      "video/ogg"
+    ];
+    var ALLOWED_ATTACHMENT_EXTENSIONS = [
+      ".jpg",
+      ".jpeg",
+      ".png",
+      ".gif",
+      ".webp",
+      ".pdf",
+      ".epub",
+      ".txt",
+      ".md",
+      ".mp3",
+      ".m4a",
+      ".wav",
+      ".webm",
+      ".ogg",
+      ".mp4",
+      ".mov"
+    ];
     var ARENA_FRONTMATTER_KEYS = [
       "blockid",
       "class",
@@ -30,11 +70,15 @@ var require_constants = __commonJS({
       "updated_at"
     ];
     var DEFAULT_SETTINGS = {
+      language: "auto",
       token: "",
       username: "",
       folder: DEFAULT_FOLDER,
+      channelFolders: {},
       downloadAttachments: false,
       attachmentsFolderName: "_assets",
+      publishCodeBlockFilter: "",
+      publishStripCallouts: false,
       channelsCache: [],
       channelBrowser: {
         nextPage: 1,
@@ -53,6 +97,8 @@ var require_constants = __commonJS({
       ARENA_MAX_PAGES_PER_RUN,
       ARENA_MAX_ASSET_DOWNLOADS_PER_RUN,
       ARENA_RESPONSE_CACHE_LIMIT,
+      ALLOWED_ATTACHMENT_MIME_TYPES,
+      ALLOWED_ATTACHMENT_EXTENSIONS,
       ARENA_FRONTMATTER_KEYS,
       DEFAULT_SETTINGS
     };
@@ -63,9 +109,25 @@ var require_constants = __commonJS({
 var require_arena_client = __commonJS({
   "src/arena-client.js"(exports2, module2) {
     "use strict";
+    var { requestUrl } = require("obsidian");
     var { ARENA_API, ARENA_PAGE_SIZE, ARENA_REQUEST_DELAY_MS } = require_constants();
     function sleep(ms) {
       return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+    function getHeaderValue(headers = {}, name) {
+      const target = String(name || "").toLowerCase();
+      for (const [key, value] of Object.entries(headers || {})) {
+        if (String(key).toLowerCase() === target) return String(value);
+      }
+      return "";
+    }
+    function parseJsonSafely(text) {
+      if (!text) return null;
+      try {
+        return JSON.parse(text);
+      } catch {
+        return null;
+      }
     }
     var ArenaClient = class {
       constructor(token, options = {}) {
@@ -76,7 +138,6 @@ var require_arena_client = __commonJS({
       }
       headers() {
         return {
-          "Content-Type": "application/json",
           Authorization: `Bearer ${this.token}`
         };
       }
@@ -85,10 +146,10 @@ var require_arena_client = __commonJS({
         if (waitMs > 0) await sleep(waitMs);
         this.lastRequestAt = Date.now();
       }
-      getRetryDelayMs(res, attempt) {
-        const retryAfter = parseInt(res.headers.get("Retry-After") || "", 10);
+      getRetryDelayMs(headers, attempt) {
+        const retryAfter = parseInt(getHeaderValue(headers, "Retry-After") || "", 10);
         if (Number.isFinite(retryAfter) && retryAfter > 0) return retryAfter * 1e3;
-        const reset = parseInt(res.headers.get("X-RateLimit-Reset") || "", 10);
+        const reset = parseInt(getHeaderValue(headers, "X-RateLimit-Reset") || "", 10);
         if (Number.isFinite(reset) && reset > 0) {
           return Math.max(reset * 1e3 - Date.now(), 1e3);
         }
@@ -98,29 +159,44 @@ var require_arena_client = __commonJS({
         let lastStatus = 0;
         for (let attempt = 0; attempt < 3; attempt++) {
           await this.paceRequest();
-          const res = await fetch(url, options);
-          lastStatus = res.status;
-          if (res.status === 429) {
-            const waitMs = this.getRetryDelayMs(res, attempt);
+          const response = await requestUrl({
+            url,
+            method: options.method || "GET",
+            headers: options.headers,
+            body: options.body,
+            contentType: options.contentType,
+            throw: false
+          });
+          lastStatus = response.status;
+          if (response.status === 429) {
+            const waitMs = this.getRetryDelayMs(response.headers, attempt);
             console.warn(`arena-manager: rate limit, esperando ${waitMs}ms`);
             await sleep(waitMs);
             continue;
           }
-          if (requestOptions.allowNotModified && res.status === 304) {
+          if (requestOptions.allowNotModified && response.status === 304) {
             return {
               status: 304,
               data: null,
-              etag: res.headers.get("ETag") || null
+              etag: getHeaderValue(response.headers, "ETag") || null
             };
           }
-          if (!res.ok) {
-            throw new Error(`Request failed, status ${res.status} \u2014 ${url.toString()}`);
+          if (response.status < 200 || response.status >= 300) {
+            const payload = parseJsonSafely(response.text || "");
+            const detail = payload?.details?.message || payload?.error || "";
+            const error = new Error(
+              detail ? `${detail} (${response.status})` : `Request failed, status ${response.status} \u2014 ${url.toString()}`
+            );
+            error.status = response.status;
+            error.url = url.toString();
+            error.payload = payload;
+            throw error;
           }
-          const text = await res.text();
+          const text = response.text || "";
           return {
-            status: res.status,
+            status: response.status,
             data: text ? JSON.parse(text) : {},
-            etag: res.headers.get("ETag") || null
+            etag: getHeaderValue(response.headers, "ETag") || null
           };
         }
         throw new Error(`Request failed after retries, status ${lastStatus} \u2014 ${url.toString()}`);
@@ -134,12 +210,13 @@ var require_arena_client = __commonJS({
         Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
         const headers = this.headers();
         if (etag) headers["If-None-Match"] = etag;
-        return this.requestJson(url.toString(), { headers }, { allowNotModified: true });
+        return this.requestJson(url.toString(), { method: "GET", headers }, { allowNotModified: true });
       }
       async post(path, body = {}) {
         const result = await this.requestJson(`${this.base}${path}`, {
           method: "POST",
           headers: this.headers(),
+          contentType: "application/json",
           body: JSON.stringify(body)
         });
         return result.data;
@@ -148,6 +225,7 @@ var require_arena_client = __commonJS({
         const result = await this.requestJson(`${this.base}${path}`, {
           method: "PUT",
           headers: this.headers(),
+          contentType: "application/json",
           body: JSON.stringify(body)
         });
         return result.data;
@@ -186,21 +264,68 @@ var require_modals = __commonJS({
   "src/modals.js"(exports2, module2) {
     "use strict";
     var { Modal } = require("obsidian");
+    var MODAL_FALLBACKS = {
+      "common.accept": "OK",
+      "common.cancel": "Cancel",
+      "common.continue": "Continue",
+      "common.blocks": "blocks",
+      "common.unnamedChannel": "Untitled channel",
+      "modals.confirm.title": "Confirm action",
+      "modals.channelSelect.title": "Select an Are.na channel",
+      "modals.channelSelect.emptyMessage": "No results.",
+      "modals.channelSelect.manualButton": "Use manual slug",
+      "modals.channelSelect.refreshButton": "Refresh",
+      "modals.channelSelect.filterPlaceholder": "Filter channels\u2026",
+      "modals.channelSelect.updating": "Refreshing channels\u2026",
+      "modals.channelSelect.updated": "List updated.",
+      "modals.channelSelect.refreshFailed": "Could not refresh: {{error}}",
+      "modals.channelSelect.loadMoreRemote": "Load {{count}} more",
+      "modals.channelSelect.loadMoreVisible": "Show {{count}} more",
+      "modals.channelSelect.loadingMore": "Loading more channels\u2026",
+      "modals.channelSelect.loadMoreFailed": "Could not load more: {{error}}",
+      "modals.channelSelect.loadedSummary": "Showing {{visible}}/{{filtered}} \xB7 {{loaded}}",
+      "modals.channelSelect.loadedCount": "{{count}} loaded",
+      "modals.channelSelect.loadedCountWithTotal": "{{count}}/{{total}} loaded",
+      "modals.channelSelect.emptyWithMore": "{{message}} Load more channels to keep searching.",
+      "modals.createChannel.title": "Create Are.na channel",
+      "modals.createChannel.nameLabel": "Channel name",
+      "modals.createChannel.namePlaceholder": "My channel",
+      "modals.createChannel.visibilityLabel": "Visibility",
+      "modals.createChannel.visibilityPublic": "Public - anyone can view and add",
+      "modals.createChannel.visibilityClosed": "Closed - anyone can view, only you can add",
+      "modals.createChannel.visibilityPrivate": "Private - only you can view and add",
+      "modals.createChannel.submit": "Create channel"
+    };
+    function interpolate(template, variables = {}) {
+      return String(template).replace(/\{\{(\w+)\}\}/g, (_, key) => {
+        const value = variables[key];
+        return value == null ? "" : String(value);
+      });
+    }
+    function fallbackT(key, variables = {}) {
+      const template = MODAL_FALLBACKS[key] || key;
+      return interpolate(template, variables);
+    }
     var InputModal = class extends Modal {
-      constructor(app, title, placeholder, onSubmit) {
+      constructor(app, title, placeholder, onSubmit, options = {}) {
         super(app);
         this.title = title;
         this.placeholder = placeholder;
         this.onSubmit = onSubmit;
+        this.submitText = options.submitText || fallbackT("common.accept");
       }
       onOpen() {
         const { contentEl } = this;
+        contentEl.addClass("arena-bridge-modal");
         contentEl.createEl("h2", { text: this.title });
-        const input = contentEl.createEl("input", { type: "text", placeholder: this.placeholder });
-        input.style.cssText = "width:100%;margin:12px 0;padding:8px;font-size:14px;";
+        const input = contentEl.createEl("input", {
+          type: "text",
+          placeholder: this.placeholder,
+          cls: "arena-bridge-modal__input"
+        });
         input.focus();
-        const button = contentEl.createEl("button", { text: "Aceptar" });
-        button.style.cssText = "float:right;margin-top:8px;";
+        const actionsEl = contentEl.createDiv({ cls: "arena-bridge-modal__actions" });
+        const button = actionsEl.createEl("button", { text: this.submitText, cls: "mod-cta" });
         button.onclick = () => {
           const value = input.value.trim();
           if (value) {
@@ -216,17 +341,63 @@ var require_modals = __commonJS({
         this.contentEl.empty();
       }
     };
+    var ConfirmModal = class extends Modal {
+      constructor(app, message, onDecision, options = {}) {
+        super(app);
+        this.message = message;
+        this.onDecision = onDecision;
+        this.t = typeof options.t === "function" ? options.t : fallbackT;
+        this.title = options.title || this.t("modals.confirm.title");
+        this.confirmText = options.confirmText || this.t("common.continue");
+        this.cancelText = options.cancelText || this.t("common.cancel");
+        this.resolved = false;
+      }
+      resolve(decision) {
+        if (this.resolved) return;
+        this.resolved = true;
+        this.onDecision(Boolean(decision));
+      }
+      onOpen() {
+        const { contentEl } = this;
+        contentEl.addClass("arena-bridge-modal");
+        contentEl.createEl("h2", { text: this.title });
+        contentEl.createEl("p", {
+          text: this.message,
+          cls: "arena-bridge-modal__message"
+        });
+        const actionsEl = contentEl.createDiv({ cls: "arena-bridge-modal__actions" });
+        const cancelButton = actionsEl.createEl("button", { text: this.cancelText });
+        const confirmButton = actionsEl.createEl("button", {
+          text: this.confirmText,
+          cls: "mod-cta"
+        });
+        cancelButton.onclick = () => this.close();
+        confirmButton.onclick = () => {
+          this.resolve(true);
+          this.close();
+        };
+        this.scope.register([], "Enter", () => {
+          confirmButton.click();
+          return false;
+        });
+      }
+      onClose() {
+        this.resolve(false);
+        this.contentEl.empty();
+      }
+    };
     var ChannelSelectModal = class extends Modal {
       constructor(app, channels, onSelect, options = {}) {
         super(app);
         this.channels = Array.isArray(channels) ? channels : [];
         this.onSelect = onSelect;
-        this.title = options.title || "Selecciona un canal de Are.na";
-        this.emptyMessage = options.emptyMessage || "Sin resultados.";
+        this.t = typeof options.t === "function" ? options.t : fallbackT;
+        this.title = options.title || this.t("modals.channelSelect.title");
+        this.emptyMessage = options.emptyMessage || this.t("modals.channelSelect.emptyMessage");
         this.onManualInput = options.onManualInput || null;
-        this.manualButtonText = options.manualButtonText || "Usar slug manual";
+        this.manualButtonText = options.manualButtonText || this.t("modals.channelSelect.manualButton");
         this.onRefresh = options.onRefresh || null;
-        this.refreshButtonText = options.refreshButtonText || "Refrescar";
+        this.refreshButtonText = options.refreshButtonText || this.t("modals.channelSelect.refreshButton");
         this.onLoadMore = options.onLoadMore || null;
         this.hasMore = Boolean(options.hasMore);
         this.totalChannels = Number.isFinite(options.totalChannels) ? options.totalChannels : null;
@@ -234,25 +405,26 @@ var require_modals = __commonJS({
       }
       onOpen() {
         const { contentEl } = this;
+        contentEl.addClass("arena-bridge-modal");
         contentEl.createEl("h2", { text: this.title });
-        const actionsEl = contentEl.createEl("div");
-        actionsEl.style.cssText = "display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 12px;";
-        const searchInput = contentEl.createEl("input", { type: "text", placeholder: "Filtrar canales\u2026" });
-        searchInput.style.cssText = "width:100%;margin:0 0 12px;padding:8px;font-size:13px;";
+        const actionsEl = contentEl.createDiv({ cls: "arena-bridge-channel-select__actions" });
+        const searchInput = contentEl.createEl("input", {
+          type: "text",
+          placeholder: this.t("modals.channelSelect.filterPlaceholder"),
+          cls: "arena-bridge-modal__input"
+        });
         let visibleCount = this.pageSize;
         let messageEl = null;
         let summaryEl = null;
         const setMessage = (message = "") => {
           if (!messageEl) {
-            messageEl = contentEl.createEl("div");
-            messageEl.style.cssText = "font-size:12px;color:var(--text-muted);margin:-4px 0 8px;";
+            messageEl = contentEl.createDiv({ cls: "arena-bridge-channel-select__message" });
           }
           messageEl.setText(message);
         };
         const setSummary = (message = "") => {
           if (!summaryEl) {
-            summaryEl = contentEl.createEl("div");
-            summaryEl.style.cssText = "font-size:12px;color:var(--text-muted);margin:-4px 0 8px;";
+            summaryEl = contentEl.createDiv({ cls: "arena-bridge-channel-select__summary" });
           }
           summaryEl.setText(message);
         };
@@ -271,14 +443,14 @@ var require_modals = __commonJS({
           const refreshButton = actionsEl.createEl("button", { text: this.refreshButtonText });
           refreshButton.onclick = async () => {
             refreshButton.disabled = true;
-            setMessage("Actualizando canales\u2026");
+            setMessage(this.t("modals.channelSelect.updating"));
             try {
               applyChannelState(await this.onRefresh());
               visibleCount = this.pageSize;
-              setMessage("Lista actualizada.");
+              setMessage(this.t("modals.channelSelect.updated"));
               renderList(searchInput.value);
             } catch (error) {
-              setMessage(`No se pudo refrescar: ${error.message}`);
+              setMessage(this.t("modals.channelSelect.refreshFailed", { error: error.message }));
             } finally {
               refreshButton.disabled = false;
             }
@@ -291,36 +463,33 @@ var require_modals = __commonJS({
             this.onManualInput();
           };
         }
-        const list = contentEl.createEl("div");
-        list.style.cssText = "max-height:360px;overflow-y:auto;";
-        const loadMoreWrap = contentEl.createEl("div");
-        loadMoreWrap.style.cssText = "display:flex;justify-content:flex-end;margin-top:12px;";
+        const list = contentEl.createDiv({ cls: "arena-bridge-channel-select__list" });
+        const loadMoreWrap = contentEl.createDiv({ cls: "arena-bridge-modal__actions" });
         const loadMoreButton = loadMoreWrap.createEl("button");
-        loadMoreButton.setText(`Cargar ${this.pageSize} m\xE1s`);
+        loadMoreButton.setText(this.t("modals.channelSelect.loadMoreRemote", { count: this.pageSize }));
         const renderList = (filter = "") => {
           list.empty();
           const filtered = getFilteredChannels(filter);
           const visible = filtered.slice(0, visibleCount);
-          const loadedLabel = Number.isFinite(this.totalChannels) ? `${this.channels.length}/${this.totalChannels} cargados` : `${this.channels.length} cargados`;
-          setSummary(`Mostrando ${visible.length}/${filtered.length} \xB7 ${loadedLabel}`);
+          const loadedLabel = Number.isFinite(this.totalChannels) ? this.t("modals.channelSelect.loadedCountWithTotal", { count: this.channels.length, total: this.totalChannels }) : this.t("modals.channelSelect.loadedCount", { count: this.channels.length });
+          setSummary(this.t("modals.channelSelect.loadedSummary", {
+            visible: visible.length,
+            filtered: filtered.length,
+            loaded: loadedLabel
+          }));
           if (visible.length === 0) {
-            const emptyText = this.hasMore ? `${this.emptyMessage} Carga m\xE1s canales para seguir buscando.` : this.emptyMessage;
+            const emptyText = this.hasMore ? this.t("modals.channelSelect.emptyWithMore", { message: this.emptyMessage }) : this.emptyMessage;
             list.createEl("p", { text: emptyText });
           }
           for (const channel of visible) {
-            const item = list.createEl("div");
-            item.style.cssText = "padding:8px 12px;cursor:pointer;border-radius:4px;margin-bottom:2px;";
-            item.onmouseenter = () => {
-              item.style.background = "var(--background-modifier-hover)";
-            };
-            item.onmouseleave = () => {
-              item.style.background = "";
-            };
-            item.createEl("strong", { text: channel.title || channel.slug || "Canal sin nombre" });
+            const item = list.createDiv({ cls: "arena-bridge-channel-select__item" });
+            item.createEl("strong", { text: channel.title || channel.slug || this.t("common.unnamedChannel") });
             const count = channel.counts?.contents ?? channel.length ?? 0;
             const visibility = channel.visibility || "";
-            const meta = item.createEl("span", { text: ` \xB7 ${count} bloques \xB7 ${visibility}` });
-            meta.style.cssText = "font-size:11px;color:var(--text-muted);";
+            const meta = item.createEl("span", {
+              cls: "arena-bridge-channel-select__meta",
+              text: visibility ? ` \xB7 ${count} ${this.t("common.blocks")} \xB7 ${visibility}` : ` \xB7 ${count} ${this.t("common.blocks")}`
+            });
             item.onclick = () => {
               this.close();
               this.onSelect(channel);
@@ -330,10 +499,12 @@ var require_modals = __commonJS({
           const canLoadRemote = this.hasMore && Boolean(this.onLoadMore);
           loadMoreWrap.style.display = hasMoreVisible || canLoadRemote ? "flex" : "none";
           if (hasMoreVisible) {
-            loadMoreButton.setText(`Mostrar ${Math.min(this.pageSize, filtered.length - visibleCount)} m\xE1s`);
+            loadMoreButton.setText(this.t("modals.channelSelect.loadMoreVisible", {
+              count: Math.min(this.pageSize, filtered.length - visibleCount)
+            }));
             return;
           }
-          loadMoreButton.setText(`Cargar ${this.pageSize} m\xE1s`);
+          loadMoreButton.setText(this.t("modals.channelSelect.loadMoreRemote", { count: this.pageSize }));
         };
         loadMoreButton.onclick = async () => {
           const filter = searchInput.value;
@@ -345,14 +516,14 @@ var require_modals = __commonJS({
           }
           if (!this.onLoadMore || !this.hasMore) return;
           loadMoreButton.disabled = true;
-          setMessage("Cargando m\xE1s canales\u2026");
+          setMessage(this.t("modals.channelSelect.loadingMore"));
           try {
             applyChannelState(await this.onLoadMore());
             visibleCount += this.pageSize;
             setMessage("");
             renderList(filter);
           } catch (error) {
-            setMessage(`No se pudo cargar m\xE1s: ${error.message}`);
+            setMessage(this.t("modals.channelSelect.loadMoreFailed", { error: error.message }));
           } finally {
             loadMoreButton.disabled = false;
           }
@@ -369,31 +540,35 @@ var require_modals = __commonJS({
       }
     };
     var CreateChannelModal = class extends Modal {
-      constructor(app, onSubmit, defaultTitle = "") {
+      constructor(app, onSubmit, defaultTitle = "", options = {}) {
         super(app);
         this.onSubmit = onSubmit;
         this.defaultTitle = defaultTitle;
+        this.t = typeof options.t === "function" ? options.t : fallbackT;
       }
       onOpen() {
         const { contentEl } = this;
-        contentEl.createEl("h2", { text: "Crear canal en Are.na" });
-        contentEl.createEl("label", { text: "Nombre del canal" });
-        const titleInput = contentEl.createEl("input", { type: "text", placeholder: "Mi canal" });
-        titleInput.style.cssText = "width:100%;margin:6px 0 16px;padding:8px;font-size:14px;";
+        contentEl.addClass("arena-bridge-modal");
+        contentEl.createEl("h2", { text: this.t("modals.createChannel.title") });
+        contentEl.createEl("label", { text: this.t("modals.createChannel.nameLabel") });
+        const titleInput = contentEl.createEl("input", {
+          type: "text",
+          placeholder: this.t("modals.createChannel.namePlaceholder"),
+          cls: "arena-bridge-modal__input"
+        });
         if (this.defaultTitle) titleInput.value = this.defaultTitle;
-        contentEl.createEl("label", { text: "Visibilidad" });
-        const select = contentEl.createEl("select");
-        select.style.cssText = "width:100%;margin:6px 0 16px;padding:8px;font-size:14px;";
+        contentEl.createEl("label", { text: this.t("modals.createChannel.visibilityLabel") });
+        const select = contentEl.createEl("select", { cls: "arena-bridge-modal__input" });
         [
-          ["public", "P\xFAblico \u2014 cualquiera puede ver y a\xF1adir"],
-          ["closed", "Cerrado \u2014 cualquiera puede ver, solo t\xFA a\xF1ades"],
-          ["private", "Privado \u2014 solo t\xFA puedes ver y a\xF1adir"]
+          ["public", this.t("modals.createChannel.visibilityPublic")],
+          ["closed", this.t("modals.createChannel.visibilityClosed")],
+          ["private", this.t("modals.createChannel.visibilityPrivate")]
         ].forEach(([value, label]) => {
           const option = select.createEl("option", { text: label });
           option.value = value;
         });
-        const button = contentEl.createEl("button", { text: "Crear canal" });
-        button.style.cssText = "float:right;margin-top:8px;";
+        const actionsEl = contentEl.createDiv({ cls: "arena-bridge-modal__actions" });
+        const button = actionsEl.createEl("button", { text: this.t("modals.createChannel.submit"), cls: "mod-cta" });
         button.onclick = () => {
           const title = titleInput.value.trim();
           if (!title) {
@@ -414,8 +589,383 @@ var require_modals = __commonJS({
     };
     module2.exports = {
       InputModal,
+      ConfirmModal,
       ChannelSelectModal,
       CreateChannelModal
+    };
+  }
+});
+
+// src/i18n.js
+var require_i18n = __commonJS({
+  "src/i18n.js"(exports2, module2) {
+    "use strict";
+    var SUPPORTED_LANGUAGES = ["en", "es"];
+    var LANGUAGE_PREFERENCE_AUTO = "auto";
+    var TRANSLATIONS = {
+      en: {
+        common: {
+          accept: "OK",
+          cancel: "Cancel",
+          continue: "Continue",
+          refresh: "Refresh",
+          untitled: "Untitled",
+          attachment: "Attachment",
+          image: "image",
+          block: "Block",
+          loadingChannels: "Loading channels\u2026",
+          loadingMoreChannels: "Loading more channels\u2026",
+          noContentType: "no content-type",
+          noExtension: "no extension",
+          blocks: "blocks",
+          unnamedChannel: "Untitled channel"
+        },
+        modals: {
+          confirm: {
+            title: "Confirm action"
+          },
+          channelSelect: {
+            title: "Select an Are.na channel",
+            emptyMessage: "No results.",
+            manualButton: "Use manual slug",
+            refreshButton: "Refresh",
+            filterPlaceholder: "Filter channels\u2026",
+            updating: "Refreshing channels\u2026",
+            updated: "List updated.",
+            refreshFailed: "Could not refresh: {{error}}",
+            loadMoreRemote: "Load {{count}} more",
+            loadMoreVisible: "Show {{count}} more",
+            loadingMore: "Loading more channels\u2026",
+            loadMoreFailed: "Could not load more: {{error}}",
+            loadedSummary: "Showing {{visible}}/{{filtered}} \xB7 {{loaded}}",
+            loadedCount: "{{count}} loaded",
+            loadedCountWithTotal: "{{count}}/{{total}} loaded",
+            emptyWithMore: "{{message}} Load more channels to keep searching."
+          },
+          createChannel: {
+            title: "Create Are.na channel",
+            nameLabel: "Channel name",
+            namePlaceholder: "My channel",
+            visibilityLabel: "Visibility",
+            visibilityPublic: "Public - anyone can view and add",
+            visibilityClosed: "Closed - anyone can view, only you can add",
+            visibilityPrivate: "Private - only you can view and add",
+            submit: "Create channel"
+          }
+        },
+        commands: {
+          getBlocksFromChannel: "Get blocks from a channel",
+          browseMyChannels: "Browse my channels",
+          createChannel: "Create Are.na channel",
+          refreshChannelsCache: "Refresh channels list",
+          pullBlock: "Update note from Are.na (Pull)",
+          pushNote: "Send note to Are.na (Push)",
+          getBlockById: "Get block by ID or URL",
+          openBlockInArena: "Open block in Are.na",
+          uploadFolderAsChannel: "Upload folder as Are.na channel"
+        },
+        prompts: {
+          getBlocksFromChannelTitle: "Get blocks from a channel",
+          getBlocksFromChannelPlaceholder: "channel slug or URL",
+          pushToArenaTitle: "Send to Are.na",
+          pushToArenaPlaceholder: "destination channel slug",
+          getBlockByIdTitle: "Get block by ID or URL",
+          getBlockByIdPlaceholder: "numeric ID or Are.na URL",
+          selectDestinationChannel: "Select the destination channel",
+          manualSlugInput: "Enter slug manually"
+        },
+        notices: {
+          pluginLoaded: "Are.na Bridge v1.0.1-beta.1 loaded.",
+          pluginUnloaded: "Are.na Bridge unloaded.",
+          loadingYourChannels: "Loading your channels\u2026",
+          loadingChannelsPage: "Loading channels\u2026 page {{page}} \xB7 {{total}} found",
+          partialChannelsLoaded: 'A partial channel batch was loaded. Click "Load {{count}} more" to continue.',
+          missingLocalCache: "Are.na returned 304 without local cache for {{path}}",
+          blockedAssets: "{{count}} attachment{{suffix}} skipped because the type is not allowed. They were kept as remote links.{{sample}}",
+          blockedAssetsSample: " Types: {{types}}.",
+          importStopped: "Import stopped after {{count}} pages. For larger transfers, it is better to request permission from Are.na.",
+          confirmNextPage: "Are.na recommends loading pages on demand. Page {{page}} of {{label}} has already been processed ({{total}}). Load the next page?",
+          assetLimitReached: "The limit of {{count}} local attachments was reached in this run. The rest will stay linked remotely to avoid bulk downloads.",
+          attachmentBlocked: "Attachment blocked by unsupported type ({{contentType}} \xB7 {{url}})",
+          attachmentBlockedByPolicy: "Attachment blocked by type policy ({{contentType}} \xB7 {{url}})",
+          attachmentDownloadFailed: "Could not download attachment ({{status}})",
+          usernameMissing: "Configure your username in the settings.",
+          noChannelsFound: "No channels found.",
+          errorLoadingChannels: "Error loading channels: {{error}}",
+          channelCreated: 'Channel "{{title}}" created on Are.na',
+          errorCreatingChannel: "Error creating channel: {{error}}",
+          channelsCacheCleared: 'Channels cache cleared. The next "Browse my channels" will fetch it again.',
+          folderHasNoNotes: "This folder does not contain any `.md` notes.",
+          folderAlreadyLinkedChannel: "This folder is already linked to /{{channel}}. Reusing that channel instead of creating a new one.",
+          folderLinkedChannelDeleted: "The linked channel /{{channel}} no longer exists on Are.na. A new channel will be created.",
+          creatingChannel: 'Creating channel "{{title}}"\u2026',
+          uploadingNotesProgress: "Uploading notes\u2026 {{uploaded}}/{{total}}",
+          folderUploadSummary: '{{uploaded}} notes uploaded to channel "{{title}}"',
+          folderUploadSummarySkipped: '{{uploaded}} notes uploaded to channel "{{title}}" \xB7 {{skipped}} skipped because of {{flag}}',
+          genericError: "Error: {{error}}",
+          noteMarkedSkipped: "This note is marked with {{flag}}: true.",
+          noteMissingBlockIdFrontmatter: "This note does not have `blockid` in frontmatter.",
+          pullSkippedToProtectLocalOnlyMarkdown: "Pull skipped to protect local-only Markdown that is excluded from publishing.",
+          noteUpdatedFromBlock: "Note updated from block {{id}}",
+          blockUpdated: "Block {{id}} updated on Are.na",
+          warningLoadingChannelList: "Could not load the channel list: {{error}}",
+          notePublished: "Published to /{{channel}} as block {{id}}",
+          couldNotExtractBlockId: "Could not extract the ID.",
+          blockImported: "Block {{id}} imported",
+          noteMissingBlockId: "This note does not have `blockid`.",
+          downloadingChannel: 'Downloading channel "{{slug}}"\u2026',
+          channelImportSummary: '"{{title}}": {{saved}} blocks imported',
+          channelImportSummarySkipped: '"{{title}}": {{saved}} blocks imported \xB7 {{skipped}} skipped because of {{flag}}',
+          channelImportProtectedLocalOnlyMarkdown: "{{count}} note(s) were not overwritten to protect local-only Markdown excluded from publishing.",
+          blockImportSkippedToProtectLocalOnlyMarkdown: "The note was not overwritten to protect local-only Markdown excluded from publishing.",
+          configureToken: "Configure your Personal Access Token in the plugin settings.",
+          languageChanged: "Language updated. Reload the plugin or restart Obsidian to refresh command names.",
+          channelCacheCleared: "User/channel cache cleared.",
+          blockCacheCleared: "Blocks cache cleared.",
+          allCacheCleared: "All plugin cache has been cleared."
+        },
+        settings: {
+          title: "Are.na Bridge",
+          tokenName: "Personal Access Token",
+          tokenDesc: "Get your token from are.na/settings/oauth. For Push and channel creation, use the `write` scope. Once saved, the token is hidden.",
+          tokenPlaceholder: "Your Are.na token",
+          usernameName: "Username (slug)",
+          usernameDesc: "Your Are.na slug, for example `marco-noris`.",
+          usernamePlaceholder: "your-username",
+          languageName: "Language",
+          languageDesc: "Default UI language for the plugin. Command names update after reloading the plugin.",
+          languageAuto: "Auto (system)",
+          languageEnglish: "English",
+          languageSpanish: "Spanish",
+          folderName: "Folder",
+          folderDesc: "Vault folder where imported blocks will be stored",
+          downloadAttachmentsName: "Download attachments",
+          downloadAttachmentsDesc: "Automatically download allowed attachments (images, PDF, EPUB, audio, video, and plain text)",
+          attachmentsFolderName: "Attachments folder",
+          attachmentsFolderDesc: "Local folder name used for downloaded images and attachments",
+          publishCodeBlockFilterName: "Skip code block languages on publish",
+          publishCodeBlockFilterDesc: "Comma-separated list of fenced code block languages to remove before sending Markdown to Are.na. Example: `dataview, mermaid`",
+          publishStripCalloutsName: "Skip callouts on publish",
+          publishStripCalloutsDesc: "Remove Obsidian callout blocks like `> [!note]` before sending Markdown to Are.na.",
+          cacheDiagnosticsTitle: "Cache diagnostics",
+          cacheStatusName: "Cache status",
+          cacheStatusSummary: "{{total}} API responses \xB7 {{users}} user \xB7 {{channels}} channels \xB7 {{blocks}} blocks \xB7 {{other}} other endpoints \xB7 {{localChannels}} channels in local list",
+          clearChannelsButton: "Clear channels",
+          clearBlocksButton: "Clear blocks",
+          clearAllButton: "Clear all"
+        },
+        manifest: {
+          description: "Connect your Obsidian vault with Are.na. Import blocks and channels, publish notes, and sync content."
+        }
+      },
+      es: {
+        common: {
+          accept: "Aceptar",
+          cancel: "Cancelar",
+          continue: "Continuar",
+          refresh: "Refrescar",
+          untitled: "Sin titulo",
+          attachment: "Adjunto",
+          image: "imagen",
+          block: "Bloque",
+          loadingChannels: "Cargando canales\u2026",
+          loadingMoreChannels: "Cargando m\xE1s canales\u2026",
+          noContentType: "sin content-type",
+          noExtension: "sin extensi\xF3n",
+          blocks: "bloques",
+          unnamedChannel: "Canal sin nombre"
+        },
+        modals: {
+          confirm: {
+            title: "Confirmar acci\xF3n"
+          },
+          channelSelect: {
+            title: "Selecciona un canal de Are.na",
+            emptyMessage: "Sin resultados.",
+            manualButton: "Usar slug manual",
+            refreshButton: "Refrescar",
+            filterPlaceholder: "Filtrar canales\u2026",
+            updating: "Actualizando canales\u2026",
+            updated: "Lista actualizada.",
+            refreshFailed: "No se pudo refrescar: {{error}}",
+            loadMoreRemote: "Cargar {{count}} m\xE1s",
+            loadMoreVisible: "Mostrar {{count}} m\xE1s",
+            loadingMore: "Cargando m\xE1s canales\u2026",
+            loadMoreFailed: "No se pudo cargar m\xE1s: {{error}}",
+            loadedSummary: "Mostrando {{visible}}/{{filtered}} \xB7 {{loaded}}",
+            loadedCount: "{{count}} cargados",
+            loadedCountWithTotal: "{{count}}/{{total}} cargados",
+            emptyWithMore: "{{message}} Carga m\xE1s canales para seguir buscando."
+          },
+          createChannel: {
+            title: "Crear canal en Are.na",
+            nameLabel: "Nombre del canal",
+            namePlaceholder: "Mi canal",
+            visibilityLabel: "Visibilidad",
+            visibilityPublic: "P\xFAblico - cualquiera puede ver y a\xF1adir",
+            visibilityClosed: "Cerrado - cualquiera puede ver, solo t\xFA a\xF1ades",
+            visibilityPrivate: "Privado - solo t\xFA puedes ver y a\xF1adir",
+            submit: "Crear canal"
+          }
+        },
+        commands: {
+          getBlocksFromChannel: "Obtener bloques de un canal",
+          browseMyChannels: "Explorar mis canales",
+          createChannel: "Crear canal en Are.na",
+          refreshChannelsCache: "Actualizar lista de canales (refresco)",
+          pullBlock: "Actualizar nota desde Are.na (Pull)",
+          pushNote: "Enviar nota a Are.na (Push)",
+          getBlockById: "Obtener bloque por ID o URL",
+          openBlockInArena: "Abrir bloque en Are.na",
+          uploadFolderAsChannel: "Subir carpeta como canal a Are.na"
+        },
+        prompts: {
+          getBlocksFromChannelTitle: "Obtener bloques de canal",
+          getBlocksFromChannelPlaceholder: "slug o URL del canal",
+          pushToArenaTitle: "Enviar a Are.na",
+          pushToArenaPlaceholder: "slug del canal destino",
+          getBlockByIdTitle: "Obtener bloque por ID o URL",
+          getBlockByIdPlaceholder: "ID num\xE9rico o URL de Are.na",
+          selectDestinationChannel: "Selecciona el canal destino",
+          manualSlugInput: "Introducir slug manual"
+        },
+        notices: {
+          pluginLoaded: "Are.na Bridge v1.0.1-beta.1 cargado.",
+          pluginUnloaded: "Are.na Bridge descargado.",
+          loadingYourChannels: "Cargando tus canales\u2026",
+          loadingChannelsPage: "Cargando canales\u2026 p\xE1g. {{page}} \xB7 {{total}} encontrados",
+          partialChannelsLoaded: 'Se carg\xF3 un tramo parcial de canales. Pulsa "Cargar {{count}} m\xE1s" para seguir.',
+          missingLocalCache: "Are.na devolvi\xF3 304 sin cach\xE9 local para {{path}}",
+          blockedAssets: "Se omitieron {{count}} adjunto{{suffix}} por tipo no permitido. Se mantuvieron como enlaces remotos.{{sample}}",
+          blockedAssetsSample: " Tipos: {{types}}.",
+          importStopped: "Importaci\xF3n detenida tras {{count}} p\xE1ginas. Para cargas m\xE1s grandes, conviene pedir permiso a Are.na.",
+          confirmNextPage: "Are.na recomienda cargar p\xE1ginas bajo demanda. Ya se proces\xF3 la p\xE1gina {{page}} de {{label}} ({{total}}). \xBFCargar la siguiente p\xE1gina?",
+          assetLimitReached: "Se alcanz\xF3 el l\xEDmite de {{count}} adjuntos locales en esta ejecuci\xF3n. El resto quedar\xE1 enlazado en remoto para evitar descargas masivas.",
+          attachmentBlocked: "Adjunto bloqueado por tipo no permitido ({{contentType}} \xB7 {{url}})",
+          attachmentBlockedByPolicy: "Adjunto bloqueado por pol\xEDtica de tipos ({{contentType}} \xB7 {{url}})",
+          attachmentDownloadFailed: "No se pudo descargar adjunto ({{status}})",
+          usernameMissing: "Configura tu nombre de usuario en los ajustes.",
+          noChannelsFound: "No se encontraron canales.",
+          errorLoadingChannels: "Error al cargar canales: {{error}}",
+          channelCreated: 'Canal "{{title}}" creado en Are.na',
+          errorCreatingChannel: "Error al crear canal: {{error}}",
+          channelsCacheCleared: 'Cach\xE9 de canales borrado. El pr\xF3ximo "Explorar mis canales" lo descargar\xE1 de nuevo.',
+          folderHasNoNotes: "La carpeta no contiene notas `.md`.",
+          folderAlreadyLinkedChannel: "Esta carpeta ya est\xE1 vinculada a /{{channel}}. Se reutilizar\xE1 ese canal en vez de crear otro.",
+          folderLinkedChannelDeleted: "El canal vinculado /{{channel}} ya no existe en Are.na. Se crear\xE1 uno nuevo.",
+          creatingChannel: 'Creando canal "{{title}}"\u2026',
+          uploadingNotesProgress: "Subiendo notas\u2026 {{uploaded}}/{{total}}",
+          folderUploadSummary: '{{uploaded}} notas subidas al canal "{{title}}"',
+          folderUploadSummarySkipped: '{{uploaded}} notas subidas al canal "{{title}}" \xB7 {{skipped}} omitidas por {{flag}}',
+          genericError: "Error: {{error}}",
+          noteMarkedSkipped: "Esta nota est\xE1 marcada con {{flag}}: true.",
+          noteMissingBlockIdFrontmatter: "Esta nota no tiene `blockid` en el frontmatter.",
+          pullSkippedToProtectLocalOnlyMarkdown: "Pull omitido para proteger Markdown local que est\xE1 excluido de la publicaci\xF3n.",
+          noteUpdatedFromBlock: "Nota actualizada desde bloque {{id}}",
+          blockUpdated: "Bloque {{id}} actualizado en Are.na",
+          warningLoadingChannelList: "No se pudo cargar la lista de canales: {{error}}",
+          notePublished: "Publicado en /{{channel}} como bloque {{id}}",
+          couldNotExtractBlockId: "No se pudo extraer el ID.",
+          blockImported: "Bloque {{id}} importado",
+          noteMissingBlockId: "Esta nota no tiene `blockid`.",
+          downloadingChannel: 'Descargando canal "{{slug}}"\u2026',
+          channelImportSummary: '"{{title}}": {{saved}} bloques importados',
+          channelImportSummarySkipped: '"{{title}}": {{saved}} bloques importados \xB7 {{skipped}} omitidos por {{flag}}',
+          channelImportProtectedLocalOnlyMarkdown: "No se sobrescribieron {{count}} nota(s) para proteger Markdown local excluido de la publicaci\xF3n.",
+          blockImportSkippedToProtectLocalOnlyMarkdown: "La nota no se sobrescribi\xF3 para proteger Markdown local excluido de la publicaci\xF3n.",
+          configureToken: "Configura tu Personal Access Token en los ajustes del plugin.",
+          languageChanged: "Idioma actualizado. Recarga el plugin o reinicia Obsidian para refrescar los nombres de comandos.",
+          channelCacheCleared: "Cach\xE9 de usuario/canales vaciada.",
+          blockCacheCleared: "Cach\xE9 de bloques vaciada.",
+          allCacheCleared: "Toda la cach\xE9 del plugin ha sido vaciada."
+        },
+        settings: {
+          title: "Are.na Bridge",
+          tokenName: "Personal Access Token",
+          tokenDesc: "Obt\xE9n tu token en are.na/settings/oauth. Para Push y crear canales, usa scope `write`. Una vez guardado, el token queda oculto.",
+          tokenPlaceholder: "Tu token de Are.na",
+          usernameName: "Usuario (slug)",
+          usernameDesc: "Tu slug de Are.na, ej. `marco-noris`.",
+          usernamePlaceholder: "tu-usuario",
+          languageName: "Idioma",
+          languageDesc: "Idioma por defecto de la interfaz del plugin. Los nombres de comandos cambian al recargar el plugin.",
+          languageAuto: "Autom\xE1tico (sistema)",
+          languageEnglish: "Ingl\xE9s",
+          languageSpanish: "Espa\xF1ol",
+          folderName: "Carpeta",
+          folderDesc: "Carpeta del vault donde se guardar\xE1n los bloques importados",
+          downloadAttachmentsName: "Descargar adjuntos",
+          downloadAttachmentsDesc: "Descarga autom\xE1ticamente adjuntos permitidos (im\xE1genes, PDF, EPUB, audio, v\xEDdeo y texto plano)",
+          attachmentsFolderName: "Carpeta de adjuntos",
+          attachmentsFolderDesc: "Nombre de la carpeta local donde se guardan im\xE1genes y adjuntos descargados",
+          publishCodeBlockFilterName: "Omitir lenguajes de bloque de c\xF3digo al publicar",
+          publishCodeBlockFilterDesc: "Lista separada por comas con los lenguajes de fenced code blocks que se eliminar\xE1n antes de enviar el Markdown a Are.na. Ejemplo: `dataview, mermaid`",
+          publishStripCalloutsName: "Omitir callouts al publicar",
+          publishStripCalloutsDesc: "Elimina bloques callout de Obsidian como `> [!note]` antes de enviar el Markdown a Are.na.",
+          cacheDiagnosticsTitle: "Diagn\xF3stico de cach\xE9",
+          cacheStatusName: "Estado de la cach\xE9",
+          cacheStatusSummary: "{{total}} respuestas API \xB7 {{users}} de usuario \xB7 {{channels}} de canales \xB7 {{blocks}} de bloques \xB7 {{other}} de otros endpoints \xB7 {{localChannels}} canales en lista local",
+          clearChannelsButton: "Vaciar canales",
+          clearBlocksButton: "Vaciar bloques",
+          clearAllButton: "Vaciar todo"
+        },
+        manifest: {
+          description: "Conecta tu b\xF3veda de Obsidian con Are.na. Importa bloques y canales, publica notas y sincroniza contenido."
+        }
+      }
+    };
+    function interpolate(template, variables = {}) {
+      return String(template).replace(/\{\{(\w+)\}\}/g, (_, key) => {
+        const value = variables[key];
+        return value == null ? "" : String(value);
+      });
+    }
+    function getTranslation(language, key) {
+      return key.split(".").reduce((current, part) => {
+        if (!current || typeof current !== "object") return void 0;
+        return current[part];
+      }, TRANSLATIONS[language]);
+    }
+    function detectSystemLanguage() {
+      const candidates = [];
+      if (typeof navigator !== "undefined") {
+        if (Array.isArray(navigator.languages)) candidates.push(...navigator.languages);
+        if (navigator.language) candidates.push(navigator.language);
+      }
+      for (const candidate of candidates) {
+        const normalized = String(candidate || "").trim().toLowerCase();
+        if (!normalized) continue;
+        if (normalized.startsWith("es")) return "es";
+        if (normalized.startsWith("en")) return "en";
+      }
+      return "en";
+    }
+    function resolveLanguage(preference = LANGUAGE_PREFERENCE_AUTO) {
+      if (SUPPORTED_LANGUAGES.includes(preference)) return preference;
+      return detectSystemLanguage();
+    }
+    function createTranslator(preference = LANGUAGE_PREFERENCE_AUTO) {
+      let language = resolveLanguage(preference);
+      return {
+        get language() {
+          return language;
+        },
+        setPreference(nextPreference) {
+          language = resolveLanguage(nextPreference);
+          return language;
+        },
+        t(key, variables = {}) {
+          const template = getTranslation(language, key) ?? getTranslation("en", key);
+          if (template == null) return key;
+          if (typeof template !== "string") return template;
+          return interpolate(template, variables);
+        }
+      };
+    }
+    module2.exports = {
+      SUPPORTED_LANGUAGES,
+      LANGUAGE_PREFERENCE_AUTO,
+      createTranslator
     };
   }
 });
@@ -426,10 +976,10 @@ var require_note_utils = __commonJS({
     "use strict";
     var { SYNC_SKIP_FLAG } = require_constants();
     function sanitizeFilename(name) {
-      return (name || "Sin titulo").replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim().slice(0, 100);
+      return (name || "Untitled").replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim().slice(0, 100);
     }
     function sanitizeFolderName(name) {
-      return (name || "Sin titulo").replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim().slice(0, 100);
+      return (name || "Untitled").replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim().slice(0, 100);
     }
     function formatDate(dateStr) {
       if (!dateStr) return "";
@@ -513,7 +1063,7 @@ var require_note_utils = __commonJS({
         const attachmentUrl = options.attachmentUrl || block.attachment?.url;
         if (attachmentUrl) {
           if (options.useObsidianLinks) parts.push(`[[${attachmentUrl}]]`);
-          else parts.push(`[${block.title || "Adjunto"}](${attachmentUrl})`);
+          else parts.push(`[${block.title || "Attachment"}](${attachmentUrl})`);
         }
         const description = extractText(block.description);
         if (description) parts.push("\n" + description);
@@ -563,6 +1113,89 @@ ${frontmatterRaw}
 ---
 `;
     }
+    function normalizeCodeFenceLanguage(infoString = "") {
+      const normalized = String(infoString || "").trim().toLowerCase();
+      if (!normalized) return "";
+      const token = normalized.split(/\s+/)[0] || "";
+      return token.replace(/^\{+/, "").replace(/\}+$/, "");
+    }
+    function isCodeFenceClose(line, marker, size) {
+      const trimmed = String(line || "").trim();
+      if (!trimmed) return false;
+      return new RegExp(`^\\${marker}{${size},}\\s*$`).test(trimmed);
+    }
+    function filterMarkdownCodeBlocks(noteContent, excludedLanguages = []) {
+      const source = String(noteContent || "");
+      if (!source.trim()) return { content: source, removedBlocks: 0 };
+      const excluded = new Set(
+        (Array.isArray(excludedLanguages) ? excludedLanguages : []).map((language) => normalizeCodeFenceLanguage(language)).filter(Boolean)
+      );
+      if (excluded.size === 0) return { content: source, removedBlocks: 0 };
+      const lines = source.split(/\r?\n/);
+      const result = [];
+      let removedBlocks = 0;
+      let activeFence = null;
+      for (const line of lines) {
+        if (!activeFence) {
+          const match = String(line).match(/^\s*(`{3,}|~{3,})(.*)$/);
+          if (!match) {
+            result.push(line);
+            continue;
+          }
+          const fence = match[1];
+          const language = normalizeCodeFenceLanguage(match[2]);
+          const excludedFence = language && excluded.has(language);
+          activeFence = {
+            marker: fence[0],
+            size: fence.length,
+            excluded: excludedFence
+          };
+          if (excludedFence) {
+            removedBlocks++;
+            continue;
+          }
+          result.push(line);
+          continue;
+        }
+        if (isCodeFenceClose(line, activeFence.marker, activeFence.size)) {
+          const shouldKeepCloseFence = !activeFence.excluded;
+          activeFence = null;
+          if (shouldKeepCloseFence) result.push(line);
+          continue;
+        }
+        if (!activeFence.excluded) result.push(line);
+      }
+      return { content: result.join("\n"), removedBlocks };
+    }
+    function isMarkdownCalloutStart(line) {
+      return /^\s*>\s*\[![^\]]+\][+-]?\s*/i.test(String(line || ""));
+    }
+    function isMarkdownBlockquoteLine(line) {
+      return /^\s*>/.test(String(line || ""));
+    }
+    function filterMarkdownCallouts(noteContent, { stripCallouts = false } = {}) {
+      const source = String(noteContent || "");
+      if (!source.trim() || !stripCallouts) return { content: source, removedCallouts: 0 };
+      const lines = source.split(/\r?\n/);
+      const result = [];
+      let removedCallouts = 0;
+      let insideCallout = false;
+      for (const line of lines) {
+        if (!insideCallout) {
+          if (isMarkdownCalloutStart(line)) {
+            insideCallout = true;
+            removedCallouts++;
+            continue;
+          }
+          result.push(line);
+          continue;
+        }
+        if (isMarkdownBlockquoteLine(line)) continue;
+        insideCallout = false;
+        result.push(line);
+      }
+      return { content: result.join("\n"), removedCallouts };
+    }
     module2.exports = {
       sanitizeFilename,
       sanitizeFolderName,
@@ -572,7 +1205,10 @@ ${frontmatterRaw}
       blockToContent,
       splitNoteContent,
       extractFrontmatterScalar,
-      replaceBodyPreservingFrontmatter
+      replaceBodyPreservingFrontmatter,
+      normalizeCodeFenceLanguage,
+      filterMarkdownCodeBlocks,
+      filterMarkdownCallouts
     };
   }
 });
@@ -581,7 +1217,7 @@ ${frontmatterRaw}
 var require_plugin = __commonJS({
   "src/plugin.js"(exports2, module2) {
     "use strict";
-    var { Plugin, PluginSettingTab, Setting, Notice, TFile, TFolder, normalizePath } = require("obsidian");
+    var { Plugin, PluginSettingTab, Setting, Notice, TFile, TFolder, normalizePath, requestUrl } = require("obsidian");
     var {
       DEFAULT_FOLDER,
       SYNC_SKIP_FLAG,
@@ -590,10 +1226,13 @@ var require_plugin = __commonJS({
       CHANNEL_SELECT_BATCH_SIZE,
       ARENA_MAX_PAGES_PER_RUN,
       ARENA_MAX_ASSET_DOWNLOADS_PER_RUN,
-      ARENA_RESPONSE_CACHE_LIMIT
+      ARENA_RESPONSE_CACHE_LIMIT,
+      ALLOWED_ATTACHMENT_MIME_TYPES,
+      ALLOWED_ATTACHMENT_EXTENSIONS
     } = require_constants();
     var { ArenaClient } = require_arena_client();
-    var { InputModal, ChannelSelectModal, CreateChannelModal } = require_modals();
+    var { InputModal, ConfirmModal, ChannelSelectModal, CreateChannelModal } = require_modals();
+    var { SUPPORTED_LANGUAGES, LANGUAGE_PREFERENCE_AUTO, createTranslator } = require_i18n();
     var {
       sanitizeFilename,
       sanitizeFolderName,
@@ -603,7 +1242,10 @@ var require_plugin = __commonJS({
       blockToContent,
       splitNoteContent,
       extractFrontmatterScalar,
-      replaceBodyPreservingFrontmatter
+      replaceBodyPreservingFrontmatter,
+      normalizeCodeFenceLanguage,
+      filterMarkdownCodeBlocks,
+      filterMarkdownCallouts
     } = require_note_utils();
     function createChannelBrowserState() {
       return {
@@ -611,6 +1253,13 @@ var require_plugin = __commonJS({
         totalChannels: null,
         exhausted: false
       };
+    }
+    function getHeaderValue(headers = {}, name) {
+      const target = String(name || "").toLowerCase();
+      for (const [key, value] of Object.entries(headers || {})) {
+        if (String(key).toLowerCase() === target) return String(value);
+      }
+      return "";
     }
     var ArenaManagerPlugin = class extends Plugin {
       async onload() {
@@ -621,13 +1270,23 @@ var require_plugin = __commonJS({
         this.addSettingTab(new ArenaSettingsTab(this.app, this));
         this.registerCommands();
         this.registerFolderMenu();
-        console.log("Are.na Bridge v2 cargado.");
+        console.log(this.t("notices.pluginLoaded"));
       }
       onunload() {
-        console.log("Are.na Bridge descargado.");
+        console.log(this.t("notices.pluginUnloaded"));
+      }
+      applyI18n() {
+        this.i18n = createTranslator(this.settings.language || LANGUAGE_PREFERENCE_AUTO);
+        this.t = (key, variables = {}) => this.i18n.t(key, variables);
       }
       async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+        if (!SUPPORTED_LANGUAGES.includes(this.settings.language) && this.settings.language !== LANGUAGE_PREFERENCE_AUTO) {
+          this.settings.language = LANGUAGE_PREFERENCE_AUTO;
+        }
+        if (!this.settings.channelFolders || typeof this.settings.channelFolders !== "object" || Array.isArray(this.settings.channelFolders)) {
+          this.settings.channelFolders = {};
+        }
         if (!Array.isArray(this.settings.channelsCache)) {
           this.settings.channelsCache = [];
         }
@@ -645,15 +1304,89 @@ var require_plugin = __commonJS({
         if (!this.settings.responseCache || typeof this.settings.responseCache !== "object") {
           this.settings.responseCache = {};
         }
+        if (typeof this.settings.publishCodeBlockFilter !== "string") {
+          this.settings.publishCodeBlockFilter = "";
+        }
+        this.settings.publishStripCallouts = Boolean(this.settings.publishStripCallouts);
+        this.applyI18n();
       }
       async saveSettings() {
         await this.saveData(this.settings);
         this.arena = new ArenaClient(this.settings.token);
         this.cacheDirty = false;
+        this.applyI18n();
       }
       async persistData() {
         await this.saveData(this.settings);
         this.cacheDirty = false;
+      }
+      getChannelFolderMappings() {
+        if (!this.settings.channelFolders || typeof this.settings.channelFolders !== "object" || Array.isArray(this.settings.channelFolders)) {
+          this.settings.channelFolders = {};
+        }
+        return this.settings.channelFolders;
+      }
+      recordChannelFolder(channelSlug, folderPath) {
+        const slug = String(channelSlug || "").trim();
+        const folder = folderPath ? normalizePath(folderPath) : "";
+        if (!slug || !folder) return;
+        const channelFolders = this.getChannelFolderMappings();
+        if (channelFolders[slug] === folder) return;
+        channelFolders[slug] = folder;
+        this.cacheDirty = true;
+      }
+      forgetChannelFolder(channelSlug, folderPath = "") {
+        const slug = String(channelSlug || "").trim();
+        if (!slug) return;
+        const channelFolders = this.getChannelFolderMappings();
+        const current = channelFolders[slug];
+        if (!current) return;
+        const folder = folderPath ? normalizePath(folderPath) : "";
+        if (folder && normalizePath(current) !== folder) return;
+        delete channelFolders[slug];
+        this.cacheDirty = true;
+      }
+      getDefaultChannelFolder(channelSlug, channelTitle = "") {
+        const folderName = sanitizeFolderName(channelTitle) || channelSlug;
+        return normalizePath(`${this.settings.folder}/${folderName}`);
+      }
+      trackChannelFolderCandidate(channelFolders, channelSlug, folderPath) {
+        const slug = String(channelSlug || "").trim();
+        const folder = folderPath ? normalizePath(folderPath) : "";
+        if (!slug || !folder) return;
+        let counts = channelFolders.get(slug);
+        if (!counts) {
+          counts = /* @__PURE__ */ new Map();
+          channelFolders.set(slug, counts);
+        }
+        counts.set(folder, (counts.get(folder) || 0) + 1);
+      }
+      getPreferredChannelFolder(channelSlug, channelFolders) {
+        const slug = String(channelSlug || "").trim();
+        if (!slug || !(channelFolders instanceof Map)) return null;
+        const counts = channelFolders.get(slug);
+        if (!(counts instanceof Map) || counts.size === 0) return null;
+        let folder = "";
+        let count = 0;
+        for (const [candidate, hits] of counts.entries()) {
+          if (hits <= count) continue;
+          folder = candidate;
+          count = hits;
+        }
+        return folder ? { folder, count, counts } : null;
+      }
+      resolveChannelFolder(channelSlug, channelTitle = "", channelFolders = null) {
+        const slug = String(channelSlug || "").trim();
+        if (!slug) return normalizePath(this.settings.folder);
+        const stored = this.getChannelFolderMappings()[slug] || "";
+        const preferred = this.getPreferredChannelFolder(slug, channelFolders);
+        const storedCount = stored && preferred?.counts ? preferred.counts.get(stored) || 0 : 0;
+        let resolved = stored || this.getDefaultChannelFolder(slug, channelTitle);
+        if (preferred?.folder && (!stored || preferred.count > storedCount)) {
+          resolved = preferred.folder;
+        }
+        this.recordChannelFolder(slug, resolved);
+        return resolved;
       }
       async getSelectableChannels() {
         if (!this.settings.username) return { channels: [], total: 0, hasMore: false };
@@ -735,7 +1468,7 @@ var require_plugin = __commonJS({
         const response = await this.arena.getRevalidated(path, params, entry?.etag || null);
         if (response.status === 304) {
           if (!entry) {
-            throw new Error(`Are.na devolvi\xF3 304 sin cach\xE9 local para ${path}`);
+            throw new Error(this.t("notices.missingLocalCache", { path }));
           }
           this.touchCacheKey(cacheKey);
           return entry.data;
@@ -810,6 +1543,23 @@ var require_plugin = __commonJS({
         this.invalidateUserChannelCaches(false);
         this.updateChannelsCacheEntry(channel);
       }
+      forgetDeletedChannel(channelSlug, folderPath = "") {
+        const slug = String(channelSlug || "").trim();
+        if (!slug) return;
+        this.forgetChannelFolder(slug, folderPath);
+        this.invalidateArenaCache([
+          `/channels/${slug}`,
+          `/channels/${slug}/contents`
+        ]);
+        if (Array.isArray(this.settings.channelsCache)) {
+          this.settings.channelsCache = this.settings.channelsCache.filter((channel) => channel?.slug !== slug);
+        }
+        this.resetChannelBrowserState(true);
+        this.cacheDirty = true;
+      }
+      isArenaNotFoundError(error) {
+        return Number(error?.status || error?.payload?.code || 0) === 404;
+      }
       trackBlockMutation(block, channelSlug = "") {
         if (block?.id != null) {
           this.setArenaJsonCache(`/blocks/${block.id}`, {}, block);
@@ -865,7 +1615,10 @@ var require_plugin = __commonJS({
         const state = this.getChannelBrowserState();
         const channels = Array.isArray(this.settings.channelsCache) ? [...this.settings.channelsCache] : [];
         if (state.exhausted) return this.buildSelectableChannelsResult(channels);
-        const notice = new Notice(channels.length > 0 ? "Cargando m\xE1s canales\u2026" : "Cargando tus canales\u2026", 0);
+        const notice = new Notice(
+          channels.length > 0 ? this.t("common.loadingMoreChannels") : this.t("notices.loadingYourChannels"),
+          0
+        );
         try {
           const user = await this.getArenaJson(`/users/${this.settings.username}`);
           state.totalChannels = Number.isFinite(user.counts?.channels) ? user.counts.channels : null;
@@ -879,7 +1632,7 @@ var require_plugin = __commonJS({
           while (added < batchSize && scannedPages < ARENA_MAX_PAGES_PER_RUN) {
             const page = state.nextPage;
             const totalLabel = Number.isFinite(state.totalChannels) ? `${channels.length}/${state.totalChannels}` : `${channels.length}`;
-            notice.setMessage(`Cargando canales\u2026 p\xE1g. ${page} \xB7 ${totalLabel} encontrados`);
+            notice.setMessage(this.t("notices.loadingChannelsPage", { page, total: totalLabel }));
             const data = await this.getArenaJson(`/users/${this.settings.username}/contents`, { page });
             state.nextPage = page + 1;
             scannedPages++;
@@ -902,7 +1655,7 @@ var require_plugin = __commonJS({
           }
           this.settings.channelsCache = channels;
           if (!state.exhausted && added < batchSize) {
-            new Notice(`Se carg\xF3 un tramo parcial de canales. Pulsa "Cargar ${batchSize} m\xE1s" para seguir.`);
+            new Notice(this.t("notices.partialChannelsLoaded", { count: batchSize }));
           }
           await this.persistData();
           return this.buildSelectableChannelsResult(channels);
@@ -911,25 +1664,38 @@ var require_plugin = __commonJS({
           notice.hide();
         }
       }
-      async buildBlockFileIndex() {
+      async buildVaultIndexes() {
         const index = /* @__PURE__ */ new Map();
+        const channelFolders = /* @__PURE__ */ new Map();
         const uncachedFiles = [];
         for (const file of this.app.vault.getMarkdownFiles()) {
           const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
           if (frontmatter?.blockid != null) {
             index.set(String(frontmatter.blockid), file);
-          } else {
+          }
+          if (frontmatter?.channel && file.parent?.path) {
+            this.trackChannelFolderCandidate(channelFolders, frontmatter.channel, file.parent.path);
+          }
+          if (frontmatter?.blockid == null || !frontmatter?.channel) {
             uncachedFiles.push(file);
           }
         }
         for (const file of uncachedFiles) {
           const raw = await this.app.vault.cachedRead(file);
-          const blockId = extractFrontmatterScalar(raw, "blockid");
+          const frontmatter = this.getFileFrontmatter(file, raw);
+          const blockId = frontmatter.blockid;
           if (blockId != null) {
             index.set(String(blockId), file);
           }
+          if (frontmatter.channel && file.parent?.path) {
+            this.trackChannelFolderCandidate(channelFolders, frontmatter.channel, file.parent.path);
+          }
         }
-        return index;
+        return { blockIndex: index, channelFolders };
+      }
+      async buildBlockFileIndex() {
+        const { blockIndex } = await this.buildVaultIndexes();
+        return blockIndex;
       }
       getFileFrontmatter(file, rawContent = null) {
         const cached = this.app.metadataCache.getFileCache(file)?.frontmatter;
@@ -948,32 +1714,88 @@ var require_plugin = __commonJS({
         const frontmatter = this.getFileFrontmatter(file, content);
         return { content, body, frontmatter };
       }
+      getPublishCodeBlockFilterLanguages() {
+        return String(this.settings.publishCodeBlockFilter || "").split(",").map((value) => normalizeCodeFenceLanguage(value)).filter(Boolean);
+      }
+      prepareBodyForArena(body) {
+        const codeBlockResult = filterMarkdownCodeBlocks(body, this.getPublishCodeBlockFilterLanguages());
+        return filterMarkdownCallouts(codeBlockResult.content, {
+          stripCallouts: this.settings.publishStripCallouts
+        });
+      }
+      noteHasPublishOnlyContent(body) {
+        return this.prepareBodyForArena(body).content !== String(body || "");
+      }
+      async getFolderLinkedChannelSlug(folder, files = null) {
+        const folderPath = normalizePath(folder?.path || "");
+        if (!folderPath) return "";
+        const mappedSlugs = Object.entries(this.getChannelFolderMappings()).filter(([, path]) => normalizePath(path || "") === folderPath).map(([slug]) => String(slug || "").trim()).filter(Boolean);
+        if (mappedSlugs.length === 1) return mappedSlugs[0];
+        const noteFiles = Array.isArray(files) ? files : folder.children.filter((file) => file instanceof TFile && file.extension === "md");
+        const noteSlugs = /* @__PURE__ */ new Set();
+        for (const file of noteFiles) {
+          const cached = this.app.metadataCache.getFileCache(file)?.frontmatter;
+          if (cached?.channel) {
+            noteSlugs.add(String(cached.channel).trim());
+            continue;
+          }
+          const raw = await this.app.vault.cachedRead(file);
+          const frontmatter = this.getFileFrontmatter(file, raw);
+          if (frontmatter.channel) noteSlugs.add(String(frontmatter.channel).trim());
+        }
+        return noteSlugs.size === 1 ? [...noteSlugs][0] : "";
+      }
       createTransferState() {
         return {
           downloadedAssets: 0,
-          assetLimitNoticeShown: false
+          assetLimitNoticeShown: false,
+          blockedAssets: 0,
+          blockedAssetTypes: []
         };
+      }
+      trackBlockedAsset(transferState, contentType = "", extension = "") {
+        if (!transferState) return;
+        transferState.blockedAssets++;
+        const typeLabel = contentType || this.t("common.noContentType");
+        const extensionLabel = extension || this.t("common.noExtension");
+        const label = `${typeLabel} / ${extensionLabel}`;
+        if (!transferState.blockedAssetTypes.includes(label) && transferState.blockedAssetTypes.length < 5) {
+          transferState.blockedAssetTypes.push(label);
+        }
+      }
+      showBlockedAssetsNotice(transferState) {
+        if (!transferState?.blockedAssets) return;
+        const count = transferState.blockedAssets;
+        const suffix = count === 1 ? "" : "s";
+        const sample = transferState.blockedAssetTypes.length > 0 ? this.t("notices.blockedAssetsSample", { types: transferState.blockedAssetTypes.join(", ") }) : "";
+        new Notice(
+          this.t("notices.blockedAssets", { count, suffix, sample }),
+          8e3
+        );
       }
       async confirmNextPageLoad(label, page, processed, total = Infinity) {
         if (page >= ARENA_MAX_PAGES_PER_RUN) {
-          new Notice(
-            `Importaci\xF3n detenida tras ${ARENA_MAX_PAGES_PER_RUN} p\xE1ginas. Para cargas m\xE1s grandes, conviene pedir permiso a Are.na.`
-          );
+          new Notice(this.t("notices.importStopped", { count: ARENA_MAX_PAGES_PER_RUN }));
           return false;
         }
         const totalLabel = Number.isFinite(total) ? `${processed}/${total}` : `${processed}`;
-        return window.confirm(
-          `Are.na recomienda cargar p\xE1ginas bajo demanda. Ya se proces\xF3 la p\xE1gina ${page} de ${label} (${totalLabel}). \xBFCargar la siguiente p\xE1gina?`
-        );
+        return new Promise((resolve) => {
+          new ConfirmModal(
+            this.app,
+            this.t("notices.confirmNextPage", { page, label, total: totalLabel }),
+            resolve,
+            {
+              t: this.t
+            }
+          ).open();
+        });
       }
       canDownloadMoreAssets(transferState) {
         if (!transferState) return true;
         if (transferState.downloadedAssets < ARENA_MAX_ASSET_DOWNLOADS_PER_RUN) return true;
         if (!transferState.assetLimitNoticeShown) {
           transferState.assetLimitNoticeShown = true;
-          new Notice(
-            `Se alcanz\xF3 el l\xEDmite de ${ARENA_MAX_ASSET_DOWNLOADS_PER_RUN} adjuntos locales en esta ejecuci\xF3n. El resto quedar\xE1 enlazado en remoto para evitar descargas masivas.`
-          );
+          new Notice(this.t("notices.assetLimitReached", { count: ARENA_MAX_ASSET_DOWNLOADS_PER_RUN }));
         }
         return false;
       }
@@ -1000,14 +1822,54 @@ var require_plugin = __commonJS({
           "image/png": ".png",
           "image/gif": ".gif",
           "image/webp": ".webp",
-          "image/svg+xml": ".svg",
           "application/pdf": ".pdf",
+          "application/epub+zip": ".epub",
           "text/plain": ".txt",
-          "application/zip": ".zip",
+          "text/markdown": ".md",
           "audio/mpeg": ".mp3",
-          "video/mp4": ".mp4"
+          "audio/mp4": ".m4a",
+          "audio/x-m4a": ".m4a",
+          "audio/wav": ".wav",
+          "audio/x-wav": ".wav",
+          "audio/webm": ".webm",
+          "audio/ogg": ".ogg",
+          "video/mp4": ".mp4",
+          "video/quicktime": ".mov",
+          "video/webm": ".webm",
+          "video/ogg": ".ogg"
         };
         return known[normalized] || "";
+      }
+      normalizeContentType(contentType) {
+        return (contentType || "").split(";")[0].trim().toLowerCase();
+      }
+      isGenericBinaryContentType(contentType) {
+        return contentType === "application/octet-stream" || contentType === "binary/octet-stream";
+      }
+      validateAssetDownload(contentType, url, extension) {
+        const normalizedContentType = this.normalizeContentType(contentType);
+        const normalizedExtension = (extension || "").trim().toLowerCase();
+        const hasAllowedMime = normalizedContentType && ALLOWED_ATTACHMENT_MIME_TYPES.includes(normalizedContentType);
+        const hasAllowedExtension = normalizedExtension && ALLOWED_ATTACHMENT_EXTENSIONS.includes(normalizedExtension);
+        if (hasAllowedMime && hasAllowedExtension) {
+          return;
+        }
+        if (!normalizedContentType || this.isGenericBinaryContentType(normalizedContentType)) {
+          if (hasAllowedExtension) return;
+          const error2 = new Error(this.t("notices.attachmentBlocked", {
+            contentType: normalizedContentType || this.t("common.noContentType"),
+            url
+          }));
+          error2.assetBlockedByPolicy = true;
+          error2.assetBlockedContentType = normalizedContentType || "";
+          error2.assetBlockedExtension = normalizedExtension;
+          throw error2;
+        }
+        const error = new Error(this.t("notices.attachmentBlockedByPolicy", { contentType: normalizedContentType, url }));
+        error.assetBlockedByPolicy = true;
+        error.assetBlockedContentType = normalizedContentType;
+        error.assetBlockedExtension = normalizedExtension;
+        throw error;
       }
       async saveBinaryAsset(path, arrayBuffer) {
         const existing = this.app.vault.getAbstractFileByPath(path);
@@ -1020,15 +1882,20 @@ var require_plugin = __commonJS({
       async downloadAsset(url, targetFolder, baseName, transferState = null) {
         if (!url) return null;
         await this.arena.paceRequest();
-        const response = await fetch(url);
-        if (!response.ok) {
-          throw new Error(`No se pudo descargar adjunto (${response.status})`);
+        const response = await requestUrl({
+          url,
+          method: "GET",
+          throw: false
+        });
+        if (response.status < 200 || response.status >= 300) {
+          throw new Error(this.t("notices.attachmentDownloadFailed", { status: response.status }));
         }
-        const extension = this.getFileExtensionFromContentType(response.headers.get("content-type")) || this.getFileExtensionFromUrl(url);
+        const contentType = getHeaderValue(response.headers, "content-type");
+        const extension = this.getFileExtensionFromContentType(contentType) || this.getFileExtensionFromUrl(url);
+        this.validateAssetDownload(contentType, url, extension);
         const filename = sanitizeFilename(baseName) + extension;
         const assetPath = normalizePath(`${targetFolder}/${filename}`);
-        const buffer = await response.arrayBuffer();
-        await this.saveBinaryAsset(assetPath, buffer);
+        await this.saveBinaryAsset(assetPath, response.arrayBuffer);
         if (transferState) transferState.downloadedAssets++;
         return assetPath;
       }
@@ -1057,7 +1924,7 @@ var require_plugin = __commonJS({
             const assetPath = await this.downloadAsset(
               block.image.src,
               assetsFolder,
-              `${block.title || "imagen"}-${block.id}`,
+              `${block.title || this.t("common.image")}-${block.id}`,
               transferState
             );
             const imageSrc = this.getRelativeAssetPath(notePath, assetPath);
@@ -1069,13 +1936,16 @@ var require_plugin = __commonJS({
             const assetPath = await this.downloadAsset(
               block.attachment.url,
               assetsFolder,
-              `${block.title || "adjunto"}-${block.id}`,
+              `${block.title || this.t("common.attachment")}-${block.id}`,
               transferState
             );
             const attachmentUrl = this.getRelativeAssetPath(notePath, assetPath);
             return blockToContent(block, { attachmentUrl, useObsidianLinks: true });
           }
         } catch (error) {
+          if (error?.assetBlockedByPolicy) {
+            this.trackBlockedAsset(transferState, error.assetBlockedContentType, error.assetBlockedExtension);
+          }
           console.error("asset download error:", error);
         }
         return blockToContent(block);
@@ -1102,30 +1972,76 @@ var require_plugin = __commonJS({
           if (arenaFrontmatter[SYNC_SKIP_FLAG]) frontmatter[SYNC_SKIP_FLAG] = true;
         });
       }
+      async syncFolderToChannel(folder, files, channel, options = {}) {
+        const { forceRepublishAll = false, notice = null } = options;
+        const progressNotice = notice || new Notice(this.t("notices.uploadingNotesProgress", { uploaded: 0, total: files.length }), 0);
+        const shouldHideNotice = !notice;
+        try {
+          if (folder.path && channel.slug) this.recordChannelFolder(channel.slug, folder.path);
+          const channelRef = channel.id || channel.slug;
+          let uploaded = 0;
+          let skipped = 0;
+          for (const file of files) {
+            progressNotice.setMessage(this.t("notices.uploadingNotesProgress", { uploaded, total: files.length }));
+            const { frontmatter, body } = await this.readNoteState(file);
+            if (isSyncSkipped(frontmatter)) {
+              skipped++;
+              continue;
+            }
+            const { content: publishBody } = this.prepareBodyForArena(body);
+            let block = null;
+            const currentChannelSlug = String(channel.slug || channelRef || "").trim();
+            const noteChannelSlug = String(frontmatter.channel || "").trim();
+            const canReuseRemoteBlock = !forceRepublishAll && frontmatter.blockid && (!noteChannelSlug || noteChannelSlug === currentChannelSlug);
+            if (canReuseRemoteBlock) {
+              try {
+                block = await this.arena.updateBlock(frontmatter.blockid, publishBody, frontmatter.title || file.basename);
+              } catch (error) {
+                if (!this.isArenaNotFoundError(error)) throw error;
+              }
+            }
+            if (!block) {
+              block = await this.arena.pushBlock(channelRef, publishBody, file.basename);
+            }
+            this.trackBlockMutation(block, channel.slug);
+            await this.mergeArenaFrontmatter(file, block, channel.slug, frontmatter);
+            uploaded++;
+          }
+          const summary = skipped > 0 ? this.t("notices.folderUploadSummarySkipped", {
+            uploaded,
+            title: channel.title,
+            skipped,
+            flag: SYNC_SKIP_FLAG
+          }) : this.t("notices.folderUploadSummary", { uploaded, title: channel.title });
+          new Notice(summary);
+        } finally {
+          if (shouldHideNotice) progressNotice.hide();
+        }
+      }
       registerCommands() {
         this.addCommand({
           id: "get-blocks-from-channel",
-          name: "Obtener bloques de un canal",
+          name: this.t("commands.getBlocksFromChannel"),
           callback: () => this.cmdGetBlocksFromChannel()
         });
         this.addCommand({
           id: "browse-my-channels",
-          name: "Explorar mis canales",
+          name: this.t("commands.browseMyChannels"),
           callback: () => this.cmdBrowseMyChannels()
         });
         this.addCommand({
           id: "create-channel",
-          name: "Crear canal en Are.na",
+          name: this.t("commands.createChannel"),
           callback: () => this.cmdCreateChannel()
         });
         this.addCommand({
           id: "refresh-channels-cache",
-          name: "Actualizar lista de canales (refresco)",
+          name: this.t("commands.refreshChannelsCache"),
           callback: () => this.cmdRefreshChannelsCache()
         });
         this.addCommand({
           id: "pull-block",
-          name: "Actualizar nota desde Are.na (Pull)",
+          name: this.t("commands.pullBlock"),
           checkCallback: (checking) => {
             const file = this.app.workspace.getActiveFile();
             if (file) {
@@ -1136,7 +2052,7 @@ var require_plugin = __commonJS({
         });
         this.addCommand({
           id: "push-note",
-          name: "Enviar nota a Are.na (Push)",
+          name: this.t("commands.pushNote"),
           checkCallback: (checking) => {
             const file = this.app.workspace.getActiveFile();
             if (file) {
@@ -1147,12 +2063,12 @@ var require_plugin = __commonJS({
         });
         this.addCommand({
           id: "get-block-by-id",
-          name: "Obtener bloque por ID o URL",
+          name: this.t("commands.getBlockById"),
           callback: () => this.cmdGetBlockById()
         });
         this.addCommand({
           id: "open-block-in-arena",
-          name: "Abrir bloque en Are.na",
+          name: this.t("commands.openBlockInArena"),
           checkCallback: (checking) => {
             const file = this.app.workspace.getActiveFile();
             if (file) {
@@ -1167,33 +2083,40 @@ var require_plugin = __commonJS({
           this.app.workspace.on("file-menu", (menu, file) => {
             if (!(file instanceof TFolder)) return;
             menu.addItem((item) => {
-              item.setTitle("Subir carpeta como canal a Are.na").setIcon("upload").onClick(() => this.cmdUploadFolderAsChannel(file));
+              item.setTitle(this.t("commands.uploadFolderAsChannel")).setIcon("upload").onClick(() => this.cmdUploadFolderAsChannel(file));
             });
           })
         );
       }
       async cmdGetBlocksFromChannel() {
         if (!this.checkSettings()) return;
-        new InputModal(this.app, "Obtener bloques de canal", "slug o URL del canal", async (input) => {
-          const slug = this.extractSlug(input);
-          await this.fetchAndSaveChannel(slug);
-        }).open();
+        new InputModal(
+          this.app,
+          this.t("prompts.getBlocksFromChannelTitle"),
+          this.t("prompts.getBlocksFromChannelPlaceholder"),
+          async (input) => {
+            const slug = this.extractSlug(input);
+            await this.fetchAndSaveChannel(slug);
+          },
+          { submitText: this.t("common.accept") }
+        ).open();
       }
       async cmdBrowseMyChannels() {
         if (!this.checkSettings()) return;
         if (!this.settings.username) {
-          new Notice("\u26A0\uFE0F Configura tu nombre de usuario en los ajustes.");
+          new Notice(this.t("notices.usernameMissing"));
           return;
         }
         try {
           const channelState = await this.getSelectableChannels();
           if (channelState.channels.length === 0) {
-            new Notice("No se encontraron canales.");
+            new Notice(this.t("notices.noChannelsFound"));
             return;
           }
           new ChannelSelectModal(this.app, channelState.channels, async (channel) => {
             await this.fetchAndSaveChannel(channel.slug);
           }, {
+            t: this.t,
             hasMore: channelState.hasMore,
             totalChannels: channelState.total,
             onLoadMore: async () => this.loadMoreSelectableChannels(),
@@ -1205,7 +2128,7 @@ var require_plugin = __commonJS({
           }).open();
         } catch (error) {
           console.error("getUserChannels error:", error);
-          new Notice(`\u274C Error al cargar canales: ${error.message}`);
+          new Notice(this.t("notices.errorLoadingChannels", { error: error.message }));
         }
       }
       async cmdCreateChannel() {
@@ -1215,71 +2138,75 @@ var require_plugin = __commonJS({
             const channel = await this.arena.createChannel(title, visibility);
             this.trackChannelMutation(channel);
             await this.persistData();
-            new Notice(`\u2705 Canal "${channel.title}" creado en Are.na`);
+            new Notice(this.t("notices.channelCreated", { title: channel.title }));
           } catch (error) {
-            new Notice(`\u274C Error al crear canal: ${error.message}`);
+            new Notice(this.t("notices.errorCreatingChannel", { error: error.message }));
           }
-        }).open();
+        }, "", { t: this.t }).open();
       }
       async cmdRefreshChannelsCache() {
         if (!this.checkSettings()) return;
         this.invalidateUserChannelCaches();
         await this.persistData();
-        new Notice("Cach\xE9 de canales borrado. El pr\xF3ximo 'Explorar mis canales' lo descargar\xE1 de nuevo.");
+        new Notice(this.t("notices.channelsCacheCleared"));
       }
       async cmdUploadFolderAsChannel(folder) {
         if (!this.checkSettings()) return;
         const files = folder.children.filter((file) => file instanceof TFile && file.extension === "md");
         if (files.length === 0) {
-          new Notice("\u26A0\uFE0F La carpeta no contiene notas .md.");
+          new Notice(this.t("notices.folderHasNoNotes"));
           return;
         }
+        const linkedChannelSlug = await this.getFolderLinkedChannelSlug(folder, files);
+        if (linkedChannelSlug) {
+          try {
+            const existingChannel = await this.getArenaJson(`/channels/${linkedChannelSlug}`);
+            new Notice(this.t("notices.folderAlreadyLinkedChannel", { channel: linkedChannelSlug }));
+            await this.syncFolderToChannel(folder, files, existingChannel);
+            await this.persistData();
+            return;
+          } catch (error) {
+            if (!this.isArenaNotFoundError(error)) {
+              new Notice(this.t("notices.genericError", { error: error.message }));
+              return;
+            }
+            this.forgetDeletedChannel(linkedChannelSlug, folder.path);
+            await this.persistData();
+            new Notice(this.t("notices.folderLinkedChannelDeleted", { channel: linkedChannelSlug }));
+          }
+        }
         new CreateChannelModal(this.app, async (title, visibility) => {
-          const notice = new Notice(`Creando canal "${title}"\u2026`, 0);
+          const notice = new Notice(this.t("notices.creatingChannel", { title }), 0);
           try {
             const channel = await this.arena.createChannel(title, visibility);
             this.trackChannelMutation(channel);
-            const channelRef = channel.id || channel.slug;
-            let uploaded = 0;
-            let skipped = 0;
-            for (const file of files) {
-              notice.setMessage(`Subiendo notas\u2026 ${uploaded}/${files.length}`);
-              const { frontmatter, body } = await this.readNoteState(file);
-              if (isSyncSkipped(frontmatter)) {
-                skipped++;
-                continue;
-              }
-              if (frontmatter.blockid) {
-                const block = await this.arena.updateBlock(frontmatter.blockid, body, frontmatter.title || file.basename);
-                this.trackBlockMutation(block, channel.slug);
-              } else {
-                const block = await this.arena.pushBlock(channelRef, body, file.basename);
-                this.trackBlockMutation(block, channel.slug);
-                await this.mergeArenaFrontmatter(file, block, channel.slug, frontmatter);
-              }
-              uploaded++;
-            }
+            await this.syncFolderToChannel(folder, files, channel, {
+              forceRepublishAll: Boolean(linkedChannelSlug),
+              notice
+            });
             notice.hide();
-            const summary = skipped > 0 ? `\u2705 ${uploaded} notas subidas al canal "${channel.title}" \xB7 ${skipped} omitidas por ${SYNC_SKIP_FLAG}` : `\u2705 ${uploaded} notas subidas al canal "${channel.title}"`;
-            new Notice(summary);
             await this.persistData();
           } catch (error) {
             notice.hide();
-            new Notice(`\u274C Error: ${error.message}`);
+            new Notice(this.t("notices.genericError", { error: error.message }));
           }
-        }, folder.name).open();
+        }, folder.name, { t: this.t }).open();
       }
       async cmdPullBlock() {
         const file = this.app.workspace.getActiveFile();
         if (!file) return;
-        const { content, frontmatter } = await this.readNoteState(file);
+        const { content, body, frontmatter } = await this.readNoteState(file);
         if (isSyncSkipped(frontmatter)) {
-          new Notice(`\u26A0\uFE0F Esta nota est\xE1 marcada con ${SYNC_SKIP_FLAG}: true.`);
+          new Notice(this.t("notices.noteMarkedSkipped", { flag: SYNC_SKIP_FLAG }));
           return;
         }
         const blockId = frontmatter.blockid;
         if (!blockId) {
-          new Notice("\u26A0\uFE0F Esta nota no tiene blockid en el frontmatter.");
+          new Notice(this.t("notices.noteMissingBlockIdFrontmatter"));
+          return;
+        }
+        if (this.noteHasPublishOnlyContent(body)) {
+          new Notice(this.t("notices.pullSkippedToProtectLocalOnlyMarkdown"), 8e3);
           return;
         }
         try {
@@ -1293,9 +2220,13 @@ var require_plugin = __commonJS({
           );
           await this.app.vault.modify(file, replaceBodyPreservingFrontmatter(content, newBody));
           await this.mergeArenaFrontmatter(file, block, frontmatter.channel || "", frontmatter);
-          new Notice(`\u2705 Nota actualizada desde bloque ${blockId}`);
+          if (frontmatter.channel && file.parent?.path) {
+            this.recordChannelFolder(frontmatter.channel, file.parent.path);
+          }
+          new Notice(this.t("notices.noteUpdatedFromBlock", { id: blockId }));
+          this.showBlockedAssetsNotice(transferState);
         } catch (error) {
-          new Notice(`\u274C Error: ${error.message}`);
+          new Notice(this.t("notices.genericError", { error: error.message }));
         }
       }
       async cmdPushNote() {
@@ -1303,29 +2234,48 @@ var require_plugin = __commonJS({
         if (!file) return;
         const { body, frontmatter } = await this.readNoteState(file);
         if (isSyncSkipped(frontmatter)) {
-          new Notice(`\u26A0\uFE0F Esta nota est\xE1 marcada con ${SYNC_SKIP_FLAG}: true.`);
+          new Notice(this.t("notices.noteMarkedSkipped", { flag: SYNC_SKIP_FLAG }));
           return;
         }
         const blockId = frontmatter.blockid;
         const title = frontmatter.title || file.basename;
+        const { content: publishBody } = this.prepareBodyForArena(body);
         if (blockId) {
           try {
-            const block = await this.arena.updateBlock(blockId, body, title);
+            const block = await this.arena.updateBlock(blockId, publishBody, title);
             this.trackBlockMutation(block, frontmatter.channel || "");
+            await this.mergeArenaFrontmatter(file, block, frontmatter.channel || "", frontmatter);
+            if (frontmatter.channel && file.parent?.path) {
+              this.recordChannelFolder(frontmatter.channel, file.parent.path);
+            }
             await this.persistData();
-            new Notice(`\u2705 Bloque ${blockId} actualizado en Are.na`);
+            new Notice(this.t("notices.blockUpdated", { id: blockId }));
           } catch (error) {
-            new Notice(`\u274C Error al actualizar: ${error.message}`);
+            if (this.isArenaNotFoundError(error)) {
+              if (frontmatter.channel) {
+                await this.publishNoteToArena(file, frontmatter, publishBody, title, frontmatter.channel, frontmatter.channel);
+                return;
+              }
+              await this.promptPushNoteChannel(file, { ...frontmatter, blockid: null }, publishBody, title);
+              return;
+            }
+            new Notice(this.t("notices.genericError", { error: error.message }));
           }
         } else {
-          await this.promptPushNoteChannel(file, frontmatter, body, title);
+          await this.promptPushNoteChannel(file, frontmatter, publishBody, title);
         }
       }
       async promptPushNoteChannel(file, frontmatter, body, title) {
         const openManualInput = () => {
-          new InputModal(this.app, "Enviar a Are.na", "slug del canal destino", async (slug) => {
-            await this.publishNoteToArena(file, frontmatter, body, title, slug, slug);
-          }).open();
+          new InputModal(
+            this.app,
+            this.t("prompts.pushToArenaTitle"),
+            this.t("prompts.pushToArenaPlaceholder"),
+            async (slug) => {
+              await this.publishNoteToArena(file, frontmatter, body, title, slug, slug);
+            },
+            { submitText: this.t("common.accept") }
+          ).open();
         };
         if (!this.settings.username) {
           openManualInput();
@@ -1342,12 +2292,13 @@ var require_plugin = __commonJS({
             const channelSlug = channel.slug || String(channelRef);
             await this.publishNoteToArena(file, frontmatter, body, title, channelRef, channelSlug);
           }, {
-            title: "Selecciona el canal destino",
+            t: this.t,
+            title: this.t("prompts.selectDestinationChannel"),
             hasMore: channelState.hasMore,
             totalChannels: channelState.total,
             onLoadMore: async () => this.loadMoreSelectableChannels(),
             onManualInput: openManualInput,
-            manualButtonText: "Introducir slug manual",
+            manualButtonText: this.t("prompts.manualSlugInput"),
             onRefresh: async () => {
               this.invalidateUserChannelCaches();
               await this.persistData();
@@ -1356,7 +2307,7 @@ var require_plugin = __commonJS({
           }).open();
         } catch (error) {
           console.error("push-note channels error:", error);
-          new Notice(`\u26A0\uFE0F No se pudo cargar la lista de canales: ${error.message}`);
+          new Notice(this.t("notices.warningLoadingChannelList", { error: error.message }));
           openManualInput();
         }
       }
@@ -1365,28 +2316,41 @@ var require_plugin = __commonJS({
           const block = await this.arena.pushBlock(channelRef, body, title);
           this.trackBlockMutation(block, channelSlug);
           await this.mergeArenaFrontmatter(file, block, channelSlug, frontmatter);
+          if (file.parent?.path) this.recordChannelFolder(channelSlug, file.parent.path);
           await this.persistData();
-          new Notice(`\u2705 Publicado en /${channelSlug} como bloque ${block.id}`);
+          new Notice(this.t("notices.notePublished", { channel: channelSlug, id: block.id }));
         } catch (error) {
-          new Notice(`\u274C Error al publicar: ${error.message}`);
+          new Notice(this.t("notices.genericError", { error: error.message }));
         }
       }
       async cmdGetBlockById() {
         if (!this.checkSettings()) return;
-        new InputModal(this.app, "Obtener bloque por ID o URL", "ID num\xE9rico o URL de Are.na", async (input) => {
-          const id = this.extractBlockId(input);
-          if (!id) {
-            new Notice("\u26A0\uFE0F No se pudo extraer el ID.");
-            return;
-          }
-          try {
-            const block = await this.arena.getBlock(id);
-            await this.saveBlock(block, "", null, null, this.createTransferState());
-            new Notice(`\u2705 Bloque ${id} importado`);
-          } catch (error) {
-            new Notice(`\u274C Error: ${error.message}`);
-          }
-        }).open();
+        new InputModal(
+          this.app,
+          this.t("prompts.getBlockByIdTitle"),
+          this.t("prompts.getBlockByIdPlaceholder"),
+          async (input) => {
+            const id = this.extractBlockId(input);
+            if (!id) {
+              new Notice(this.t("notices.couldNotExtractBlockId"));
+              return;
+            }
+            try {
+              const block = await this.arena.getBlock(id);
+              const transferState = this.createTransferState();
+              const result = await this.saveBlock(block, "", null, null, transferState);
+              if (!result.written && result.reason === "local_publish_only") {
+                new Notice(this.t("notices.blockImportSkippedToProtectLocalOnlyMarkdown"), 8e3);
+                return;
+              }
+              new Notice(this.t("notices.blockImported", { id }));
+              this.showBlockedAssetsNotice(transferState);
+            } catch (error) {
+              new Notice(this.t("notices.genericError", { error: error.message }));
+            }
+          },
+          { submitText: this.t("common.accept") }
+        ).open();
       }
       async cmdOpenInArena() {
         const file = this.app.workspace.getActiveFile();
@@ -1395,42 +2359,52 @@ var require_plugin = __commonJS({
         const blockId = frontmatter.blockid;
         const channel = frontmatter.channel;
         if (!blockId) {
-          new Notice("\u26A0\uFE0F Esta nota no tiene blockid.");
+          new Notice(this.t("notices.noteMissingBlockId"));
           return;
         }
         const url = channel ? `https://www.are.na/${this.settings.username}/${channel}/blocks/${blockId}` : `https://www.are.na/block/${blockId}`;
         window.open(url, "_blank");
       }
       async fetchAndSaveChannel(slug) {
-        new Notice(`Descargando canal "${slug}"\u2026`);
+        new Notice(this.t("notices.downloadingChannel", { slug }));
         try {
           const transferState = this.createTransferState();
           const channel = await this.getArenaJson(`/channels/${slug}`);
           const channelTitle = channel.title || slug;
-          const folderName = sanitizeFolderName(channelTitle) || slug;
-          const folder = normalizePath(`${this.settings.folder}/${folderName}`);
+          const { blockIndex, channelFolders } = await this.buildVaultIndexes();
+          const folder = this.resolveChannelFolder(slug, channelTitle, channelFolders);
           await this.ensureFolder(folder);
-          const blockIndex = await this.buildBlockFileIndex();
           let saved = 0;
-          let skipped = 0;
+          let skippedByFlag = 0;
+          let skippedToProtectLocalOnly = 0;
           let page = 1;
           while (true) {
             const data = await this.getArenaJson(`/channels/${slug}/contents`, { page });
             const blocks = data.data || [];
             for (const block of blocks) {
               if (block.type === "Channel") continue;
-              const written = await this.saveBlock(block, slug, folder, blockIndex, transferState);
-              if (written) saved++;
-              else skipped++;
+              const result = await this.saveBlock(block, slug, folder, blockIndex, transferState);
+              if (result.written) saved++;
+              else if (result.reason === "sync_skip") skippedByFlag++;
+              else if (result.reason === "local_publish_only") skippedToProtectLocalOnly++;
             }
             if (!data.meta?.has_more_pages) break;
-            if (!await this.confirmNextPageLoad(`"${channelTitle}"`, page, saved + skipped, data.meta?.total_count)) break;
+            if (!await this.confirmNextPageLoad(`"${channelTitle}"`, page, saved + skippedByFlag + skippedToProtectLocalOnly, data.meta?.total_count)) break;
             page++;
           }
-          const summary = skipped > 0 ? `\u2705 "${channelTitle}": ${saved} bloques importados \xB7 ${skipped} omitidos por ${SYNC_SKIP_FLAG}` : `\u2705 "${channelTitle}": ${saved} bloques importados`;
+          const summary = skippedByFlag > 0 ? this.t("notices.channelImportSummarySkipped", {
+            title: channelTitle,
+            saved,
+            skipped: skippedByFlag,
+            flag: SYNC_SKIP_FLAG
+          }) : this.t("notices.channelImportSummary", { title: channelTitle, saved });
           new Notice(summary);
+          if (skippedToProtectLocalOnly > 0) {
+            new Notice(this.t("notices.channelImportProtectedLocalOnlyMarkdown", { count: skippedToProtectLocalOnly }), 8e3);
+          }
+          this.showBlockedAssetsNotice(transferState);
         } catch (error) {
-          new Notice(`\u274C Error: ${error.message}`);
+          new Notice(this.t("notices.genericError", { error: error.message }));
         } finally {
           if (this.cacheDirty) await this.persistData();
         }
@@ -1438,7 +2412,7 @@ var require_plugin = __commonJS({
       async saveBlock(block, channelSlug, folder = null, blockIndex = null, transferState = null) {
         const targetFolder = folder || normalizePath(this.settings.folder);
         await this.ensureFolder(targetFolder);
-        const noteTitle = sanitizeFilename(block.title || `Bloque ${block.id}`);
+        const noteTitle = sanitizeFilename(block.title || `${this.t("common.block")} ${block.id}`);
         const index = blockIndex || await this.buildBlockFileIndex();
         const blockKey = String(block.id);
         const preferredPath = normalizePath(`${targetFolder}/${noteTitle}.md`);
@@ -1454,13 +2428,19 @@ var require_plugin = __commonJS({
           }
         }
         if (existing instanceof TFile) {
-          const { content: raw, frontmatter } = await this.readNoteState(existing);
-          if (isSyncSkipped(frontmatter)) return false;
+          const { content: raw, body: localBody, frontmatter } = await this.readNoteState(existing);
+          if (isSyncSkipped(frontmatter)) return { written: false, reason: "sync_skip" };
+          if (this.noteHasPublishOnlyContent(localBody)) {
+            return { written: false, reason: "local_publish_only" };
+          }
           const body2 = await this.buildImportedBlockContent(block, targetFolder, existing.path, transferState);
           await this.app.vault.modify(existing, replaceBodyPreservingFrontmatter(raw, body2));
           await this.mergeArenaFrontmatter(existing, block, channelSlug, frontmatter);
+          if (channelSlug && existing.parent?.path) {
+            this.recordChannelFolder(channelSlug, existing.parent.path);
+          }
           index.set(blockKey, existing);
-          return true;
+          return { written: true, reason: "" };
         }
         const frontmatterYaml = frontmatterObjectToYaml(getArenaFrontmatter(block, channelSlug));
         const filename = this.app.vault.getAbstractFileByPath(preferredPath) ? this.getUniqueNotePath(targetFolder, noteTitle) : preferredPath;
@@ -1469,8 +2449,9 @@ var require_plugin = __commonJS({
 
 ${body}`;
         const createdFile = await this.app.vault.create(filename, noteContent);
+        if (channelSlug) this.recordChannelFolder(channelSlug, targetFolder);
         index.set(blockKey, createdFile);
-        return true;
+        return { written: true, reason: "" };
       }
       async ensureFolder(path) {
         const normalized = normalizePath(path);
@@ -1493,7 +2474,7 @@ ${body}`;
       }
       checkSettings() {
         if (!this.settings.token) {
-          new Notice("\u26A0\uFE0F Configura tu Personal Access Token en los ajustes del plugin.");
+          new Notice(this.t("notices.configureToken"));
           return false;
         }
         return true;
@@ -1507,63 +2488,80 @@ ${body}`;
       display() {
         const { containerEl } = this;
         containerEl.empty();
-        containerEl.createEl("h2", { text: "Are.na Bridge" });
-        new Setting(containerEl).setName("Personal Access Token").setDesc("Obt\xE9n tu token en are.na/settings/oauth. Para Push y crear canales, usa scope write.").addText(
-          (text) => text.setPlaceholder("Tu token de Are.na").setValue(this.plugin.settings.token).onChange(async (value) => {
+        containerEl.createEl("h2", { text: this.plugin.t("settings.title") });
+        new Setting(containerEl).setName(this.plugin.t("settings.tokenName")).setDesc(this.plugin.t("settings.tokenDesc")).addText(
+          (text) => text.then(() => {
+            text.inputEl.type = "password";
+            text.inputEl.autocomplete = "off";
+            text.inputEl.spellcheck = false;
+          }).setPlaceholder(this.plugin.t("settings.tokenPlaceholder")).setValue(this.plugin.settings.token).onChange(async (value) => {
             this.plugin.settings.token = value.trim();
             await this.plugin.saveSettings();
           })
         );
-        new Setting(containerEl).setName("Usuario (slug)").setDesc("Tu slug de Are.na, ej. 'marco-noris'").addText(
-          (text) => text.setPlaceholder("tu-usuario").setValue(this.plugin.settings.username).onChange(async (value) => {
+        new Setting(containerEl).setName(this.plugin.t("settings.usernameName")).setDesc(this.plugin.t("settings.usernameDesc")).addText(
+          (text) => text.setPlaceholder(this.plugin.t("settings.usernamePlaceholder")).setValue(this.plugin.settings.username).onChange(async (value) => {
             this.plugin.settings.username = value.trim();
             await this.plugin.saveSettings();
           })
         );
-        new Setting(containerEl).setName("Carpeta").setDesc("Carpeta del vault donde se guardar\xE1n los bloques").addText(
+        new Setting(containerEl).setName(this.plugin.t("settings.languageName")).setDesc(this.plugin.t("settings.languageDesc")).addDropdown(
+          (dropdown) => dropdown.addOption(LANGUAGE_PREFERENCE_AUTO, this.plugin.t("settings.languageAuto")).addOption("en", this.plugin.t("settings.languageEnglish")).addOption("es", this.plugin.t("settings.languageSpanish")).setValue(this.plugin.settings.language || LANGUAGE_PREFERENCE_AUTO).onChange(async (value) => {
+            this.plugin.settings.language = value;
+            await this.plugin.saveSettings();
+            this.display();
+            new Notice(this.plugin.t("notices.languageChanged"));
+          })
+        );
+        new Setting(containerEl).setName(this.plugin.t("settings.folderName")).setDesc(this.plugin.t("settings.folderDesc")).addText(
           (text) => text.setPlaceholder(DEFAULT_FOLDER).setValue(this.plugin.settings.folder).onChange(async (value) => {
             this.plugin.settings.folder = value.trim() || DEFAULT_FOLDER;
             await this.plugin.saveSettings();
           })
         );
-        new Setting(containerEl).setName("Descargar adjuntos").setDesc("Descarga autom\xE1ticamente archivos adjuntos").addToggle(
+        new Setting(containerEl).setName(this.plugin.t("settings.downloadAttachmentsName")).setDesc(this.plugin.t("settings.downloadAttachmentsDesc")).addToggle(
           (toggle) => toggle.setValue(this.plugin.settings.downloadAttachments).onChange(async (value) => {
             this.plugin.settings.downloadAttachments = value;
             await this.plugin.saveSettings();
           })
         );
-        new Setting(containerEl).setName("Carpeta de adjuntos").setDesc("Nombre de la carpeta local donde se guardan im\xE1genes y adjuntos descargados").addText(
+        new Setting(containerEl).setName(this.plugin.t("settings.attachmentsFolderName")).setDesc(this.plugin.t("settings.attachmentsFolderDesc")).addText(
           (text) => text.setPlaceholder("_assets").setValue(this.plugin.settings.attachmentsFolderName || "_assets").onChange(async (value) => {
             this.plugin.settings.attachmentsFolderName = sanitizeFolderName(value.trim()) || "_assets";
             await this.plugin.saveSettings();
           })
         );
-        containerEl.createEl("h3", { text: "Diagn\xF3stico de cach\xE9" });
+        new Setting(containerEl).setName(this.plugin.t("settings.publishCodeBlockFilterName")).setDesc(this.plugin.t("settings.publishCodeBlockFilterDesc")).addText(
+          (text) => text.setPlaceholder("dataview, mermaid").setValue(this.plugin.settings.publishCodeBlockFilter || "").onChange(async (value) => {
+            this.plugin.settings.publishCodeBlockFilter = value.split(",").map((part) => normalizeCodeFenceLanguage(part)).filter(Boolean).join(", ");
+            await this.plugin.saveSettings();
+          })
+        );
+        new Setting(containerEl).setName(this.plugin.t("settings.publishStripCalloutsName")).setDesc(this.plugin.t("settings.publishStripCalloutsDesc")).addToggle(
+          (toggle) => toggle.setValue(this.plugin.settings.publishStripCallouts).onChange(async (value) => {
+            this.plugin.settings.publishStripCallouts = value;
+            await this.plugin.saveSettings();
+          })
+        );
+        containerEl.createEl("h3", { text: this.plugin.t("settings.cacheDiagnosticsTitle") });
         const diagnostics = this.plugin.getCacheDiagnostics();
-        const summary = [
-          `${diagnostics.total} respuestas API`,
-          `${diagnostics.users} de usuario`,
-          `${diagnostics.channels} de canales`,
-          `${diagnostics.blocks} de bloques`,
-          `${diagnostics.other} de otros endpoints`,
-          `${diagnostics.localChannels} canales en lista local`
-        ].join(" \xB7 ");
-        new Setting(containerEl).setName("Estado de la cach\xE9").setDesc(summary).addButton(
-          (button) => button.setButtonText("Vaciar canales").onClick(async () => {
+        const summary = this.plugin.t("settings.cacheStatusSummary", diagnostics);
+        new Setting(containerEl).setName(this.plugin.t("settings.cacheStatusName")).setDesc(summary).addButton(
+          (button) => button.setButtonText(this.plugin.t("settings.clearChannelsButton")).onClick(async () => {
             await this.plugin.clearChannelCaches();
-            new Notice("Cach\xE9 de usuario/canales vaciada.");
+            new Notice(this.plugin.t("notices.channelCacheCleared"));
             this.display();
           })
         ).addButton(
-          (button) => button.setButtonText("Vaciar bloques").onClick(async () => {
+          (button) => button.setButtonText(this.plugin.t("settings.clearBlocksButton")).onClick(async () => {
             await this.plugin.clearBlockCaches();
-            new Notice("Cach\xE9 de bloques vaciada.");
+            new Notice(this.plugin.t("notices.blockCacheCleared"));
             this.display();
           })
         ).addButton(
-          (button) => button.setWarning().setButtonText("Vaciar todo").onClick(async () => {
+          (button) => button.setWarning().setButtonText(this.plugin.t("settings.clearAllButton")).onClick(async () => {
             await this.plugin.clearAllCaches();
-            new Notice("Toda la cach\xE9 del plugin ha sido vaciada.");
+            new Notice(this.plugin.t("notices.allCacheCleared"));
             this.display();
           })
         );

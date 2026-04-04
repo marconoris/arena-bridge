@@ -1,6 +1,6 @@
 "use strict";
 
-const { Plugin, PluginSettingTab, Setting, Notice, TFile, TFolder, normalizePath } = require("obsidian");
+const { Plugin, PluginSettingTab, Setting, Notice, TFile, TFolder, normalizePath, requestUrl } = require("obsidian");
 const {
   DEFAULT_FOLDER,
   SYNC_SKIP_FLAG,
@@ -10,9 +10,12 @@ const {
   ARENA_MAX_PAGES_PER_RUN,
   ARENA_MAX_ASSET_DOWNLOADS_PER_RUN,
   ARENA_RESPONSE_CACHE_LIMIT,
+  ALLOWED_ATTACHMENT_MIME_TYPES,
+  ALLOWED_ATTACHMENT_EXTENSIONS,
 } = require("./constants");
 const { ArenaClient } = require("./arena-client");
-const { InputModal, ChannelSelectModal, CreateChannelModal } = require("./modals");
+const { InputModal, ConfirmModal, ChannelSelectModal, CreateChannelModal } = require("./modals");
+const { SUPPORTED_LANGUAGES, LANGUAGE_PREFERENCE_AUTO, createTranslator } = require("./i18n");
 const {
   sanitizeFilename,
   sanitizeFolderName,
@@ -23,6 +26,9 @@ const {
   splitNoteContent,
   extractFrontmatterScalar,
   replaceBodyPreservingFrontmatter,
+  normalizeCodeFenceLanguage,
+  filterMarkdownCodeBlocks,
+  filterMarkdownCallouts,
 } = require("./note-utils");
 
 function createChannelBrowserState() {
@@ -31,6 +37,14 @@ function createChannelBrowserState() {
     totalChannels: null,
     exhausted: false,
   };
+}
+
+function getHeaderValue(headers = {}, name) {
+  const target = String(name || "").toLowerCase();
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (String(key).toLowerCase() === target) return String(value);
+  }
+  return "";
 }
 
 class ArenaManagerPlugin extends Plugin {
@@ -42,15 +56,26 @@ class ArenaManagerPlugin extends Plugin {
     this.addSettingTab(new ArenaSettingsTab(this.app, this));
     this.registerCommands();
     this.registerFolderMenu();
-    console.log("Are.na Bridge v2 cargado.");
+    console.log(this.t("notices.pluginLoaded"));
   }
 
   onunload() {
-    console.log("Are.na Bridge descargado.");
+    console.log(this.t("notices.pluginUnloaded"));
+  }
+
+  applyI18n() {
+    this.i18n = createTranslator(this.settings.language || LANGUAGE_PREFERENCE_AUTO);
+    this.t = (key, variables = {}) => this.i18n.t(key, variables);
   }
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    if (!SUPPORTED_LANGUAGES.includes(this.settings.language) && this.settings.language !== LANGUAGE_PREFERENCE_AUTO) {
+      this.settings.language = LANGUAGE_PREFERENCE_AUTO;
+    }
+    if (!this.settings.channelFolders || typeof this.settings.channelFolders !== "object" || Array.isArray(this.settings.channelFolders)) {
+      this.settings.channelFolders = {};
+    }
     if (!Array.isArray(this.settings.channelsCache)) {
       this.settings.channelsCache = [];
     }
@@ -68,17 +93,109 @@ class ArenaManagerPlugin extends Plugin {
     if (!this.settings.responseCache || typeof this.settings.responseCache !== "object") {
       this.settings.responseCache = {};
     }
+    if (typeof this.settings.publishCodeBlockFilter !== "string") {
+      this.settings.publishCodeBlockFilter = "";
+    }
+    this.settings.publishStripCallouts = Boolean(this.settings.publishStripCallouts);
+    this.applyI18n();
   }
 
   async saveSettings() {
     await this.saveData(this.settings);
     this.arena = new ArenaClient(this.settings.token);
     this.cacheDirty = false;
+    this.applyI18n();
   }
 
   async persistData() {
     await this.saveData(this.settings);
     this.cacheDirty = false;
+  }
+
+  getChannelFolderMappings() {
+    if (!this.settings.channelFolders || typeof this.settings.channelFolders !== "object" || Array.isArray(this.settings.channelFolders)) {
+      this.settings.channelFolders = {};
+    }
+    return this.settings.channelFolders;
+  }
+
+  recordChannelFolder(channelSlug, folderPath) {
+    const slug = String(channelSlug || "").trim();
+    const folder = folderPath ? normalizePath(folderPath) : "";
+    if (!slug || !folder) return;
+
+    const channelFolders = this.getChannelFolderMappings();
+    if (channelFolders[slug] === folder) return;
+    channelFolders[slug] = folder;
+    this.cacheDirty = true;
+  }
+
+  forgetChannelFolder(channelSlug, folderPath = "") {
+    const slug = String(channelSlug || "").trim();
+    if (!slug) return;
+
+    const channelFolders = this.getChannelFolderMappings();
+    const current = channelFolders[slug];
+    if (!current) return;
+
+    const folder = folderPath ? normalizePath(folderPath) : "";
+    if (folder && normalizePath(current) !== folder) return;
+
+    delete channelFolders[slug];
+    this.cacheDirty = true;
+  }
+
+  getDefaultChannelFolder(channelSlug, channelTitle = "") {
+    const folderName = sanitizeFolderName(channelTitle) || channelSlug;
+    return normalizePath(`${this.settings.folder}/${folderName}`);
+  }
+
+  trackChannelFolderCandidate(channelFolders, channelSlug, folderPath) {
+    const slug = String(channelSlug || "").trim();
+    const folder = folderPath ? normalizePath(folderPath) : "";
+    if (!slug || !folder) return;
+
+    let counts = channelFolders.get(slug);
+    if (!counts) {
+      counts = new Map();
+      channelFolders.set(slug, counts);
+    }
+    counts.set(folder, (counts.get(folder) || 0) + 1);
+  }
+
+  getPreferredChannelFolder(channelSlug, channelFolders) {
+    const slug = String(channelSlug || "").trim();
+    if (!slug || !(channelFolders instanceof Map)) return null;
+
+    const counts = channelFolders.get(slug);
+    if (!(counts instanceof Map) || counts.size === 0) return null;
+
+    let folder = "";
+    let count = 0;
+    for (const [candidate, hits] of counts.entries()) {
+      if (hits <= count) continue;
+      folder = candidate;
+      count = hits;
+    }
+
+    return folder ? { folder, count, counts } : null;
+  }
+
+  resolveChannelFolder(channelSlug, channelTitle = "", channelFolders = null) {
+    const slug = String(channelSlug || "").trim();
+    if (!slug) return normalizePath(this.settings.folder);
+
+    const stored = this.getChannelFolderMappings()[slug] || "";
+    const preferred = this.getPreferredChannelFolder(slug, channelFolders);
+    const storedCount = stored && preferred?.counts ? (preferred.counts.get(stored) || 0) : 0;
+
+    let resolved = stored || this.getDefaultChannelFolder(slug, channelTitle);
+    if (preferred?.folder && (!stored || preferred.count > storedCount)) {
+      resolved = preferred.folder;
+    }
+
+    this.recordChannelFolder(slug, resolved);
+    return resolved;
   }
 
   async getSelectableChannels() {
@@ -180,7 +297,7 @@ class ArenaManagerPlugin extends Plugin {
 
     if (response.status === 304) {
       if (!entry) {
-        throw new Error(`Are.na devolvió 304 sin caché local para ${path}`);
+        throw new Error(this.t("notices.missingLocalCache", { path }));
       }
       this.touchCacheKey(cacheKey);
       return entry.data;
@@ -264,6 +381,26 @@ class ArenaManagerPlugin extends Plugin {
     this.updateChannelsCacheEntry(channel);
   }
 
+  forgetDeletedChannel(channelSlug, folderPath = "") {
+    const slug = String(channelSlug || "").trim();
+    if (!slug) return;
+
+    this.forgetChannelFolder(slug, folderPath);
+    this.invalidateArenaCache([
+      `/channels/${slug}`,
+      `/channels/${slug}/contents`,
+    ]);
+    if (Array.isArray(this.settings.channelsCache)) {
+      this.settings.channelsCache = this.settings.channelsCache.filter((channel) => channel?.slug !== slug);
+    }
+    this.resetChannelBrowserState(true);
+    this.cacheDirty = true;
+  }
+
+  isArenaNotFoundError(error) {
+    return Number(error?.status || error?.payload?.code || 0) === 404;
+  }
+
   trackBlockMutation(block, channelSlug = "") {
     if (block?.id != null) {
       this.setArenaJsonCache(`/blocks/${block.id}`, {}, block);
@@ -329,7 +466,10 @@ class ArenaManagerPlugin extends Plugin {
     const channels = Array.isArray(this.settings.channelsCache) ? [...this.settings.channelsCache] : [];
     if (state.exhausted) return this.buildSelectableChannelsResult(channels);
 
-    const notice = new Notice(channels.length > 0 ? "Cargando más canales…" : "Cargando tus canales…", 0);
+    const notice = new Notice(
+      channels.length > 0 ? this.t("common.loadingMoreChannels") : this.t("notices.loadingYourChannels"),
+      0
+    );
     try {
       const user = await this.getArenaJson(`/users/${this.settings.username}`);
       state.totalChannels = Number.isFinite(user.counts?.channels) ? user.counts.channels : null;
@@ -345,7 +485,7 @@ class ArenaManagerPlugin extends Plugin {
       while (added < batchSize && scannedPages < ARENA_MAX_PAGES_PER_RUN) {
         const page = state.nextPage;
         const totalLabel = Number.isFinite(state.totalChannels) ? `${channels.length}/${state.totalChannels}` : `${channels.length}`;
-        notice.setMessage(`Cargando canales… pág. ${page} · ${totalLabel} encontrados`);
+        notice.setMessage(this.t("notices.loadingChannelsPage", { page, total: totalLabel }));
         const data = await this.getArenaJson(`/users/${this.settings.username}/contents`, { page });
         state.nextPage = page + 1;
         scannedPages++;
@@ -370,7 +510,7 @@ class ArenaManagerPlugin extends Plugin {
 
       this.settings.channelsCache = channels;
       if (!state.exhausted && added < batchSize) {
-        new Notice(`Se cargó un tramo parcial de canales. Pulsa "Cargar ${batchSize} más" para seguir.`);
+        new Notice(this.t("notices.partialChannelsLoaded", { count: batchSize }));
       }
       await this.persistData();
       return this.buildSelectableChannelsResult(channels);
@@ -380,27 +520,41 @@ class ArenaManagerPlugin extends Plugin {
     }
   }
 
-  async buildBlockFileIndex() {
+  async buildVaultIndexes() {
     const index = new Map();
+    const channelFolders = new Map();
     const uncachedFiles = [];
     for (const file of this.app.vault.getMarkdownFiles()) {
       const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
       if (frontmatter?.blockid != null) {
         index.set(String(frontmatter.blockid), file);
-      } else {
+      }
+      if (frontmatter?.channel && file.parent?.path) {
+        this.trackChannelFolderCandidate(channelFolders, frontmatter.channel, file.parent.path);
+      }
+      if (frontmatter?.blockid == null || !frontmatter?.channel) {
         uncachedFiles.push(file);
       }
     }
 
     for (const file of uncachedFiles) {
       const raw = await this.app.vault.cachedRead(file);
-      const blockId = extractFrontmatterScalar(raw, "blockid");
+      const frontmatter = this.getFileFrontmatter(file, raw);
+      const blockId = frontmatter.blockid;
       if (blockId != null) {
         index.set(String(blockId), file);
       }
+      if (frontmatter.channel && file.parent?.path) {
+        this.trackChannelFolderCandidate(channelFolders, frontmatter.channel, file.parent.path);
+      }
     }
 
-    return index;
+    return { blockIndex: index, channelFolders };
+  }
+
+  async buildBlockFileIndex() {
+    const { blockIndex } = await this.buildVaultIndexes();
+    return blockIndex;
   }
 
   getFileFrontmatter(file, rawContent = null) {
@@ -423,25 +577,105 @@ class ArenaManagerPlugin extends Plugin {
     return { content, body, frontmatter };
   }
 
+  getPublishCodeBlockFilterLanguages() {
+    return String(this.settings.publishCodeBlockFilter || "")
+      .split(",")
+      .map((value) => normalizeCodeFenceLanguage(value))
+      .filter(Boolean);
+  }
+
+  prepareBodyForArena(body) {
+    const codeBlockResult = filterMarkdownCodeBlocks(body, this.getPublishCodeBlockFilterLanguages());
+    return filterMarkdownCallouts(codeBlockResult.content, {
+      stripCallouts: this.settings.publishStripCallouts,
+    });
+  }
+
+  noteHasPublishOnlyContent(body) {
+    return this.prepareBodyForArena(body).content !== String(body || "");
+  }
+
+  async getFolderLinkedChannelSlug(folder, files = null) {
+    const folderPath = normalizePath(folder?.path || "");
+    if (!folderPath) return "";
+
+    const mappedSlugs = Object.entries(this.getChannelFolderMappings())
+      .filter(([, path]) => normalizePath(path || "") === folderPath)
+      .map(([slug]) => String(slug || "").trim())
+      .filter(Boolean);
+    if (mappedSlugs.length === 1) return mappedSlugs[0];
+
+    const noteFiles = Array.isArray(files)
+      ? files
+      : folder.children.filter((file) => file instanceof TFile && file.extension === "md");
+    const noteSlugs = new Set();
+
+    for (const file of noteFiles) {
+      const cached = this.app.metadataCache.getFileCache(file)?.frontmatter;
+      if (cached?.channel) {
+        noteSlugs.add(String(cached.channel).trim());
+        continue;
+      }
+      const raw = await this.app.vault.cachedRead(file);
+      const frontmatter = this.getFileFrontmatter(file, raw);
+      if (frontmatter.channel) noteSlugs.add(String(frontmatter.channel).trim());
+    }
+
+    return noteSlugs.size === 1 ? [...noteSlugs][0] : "";
+  }
+
   createTransferState() {
     return {
       downloadedAssets: 0,
       assetLimitNoticeShown: false,
+      blockedAssets: 0,
+      blockedAssetTypes: [],
     };
+  }
+
+  trackBlockedAsset(transferState, contentType = "", extension = "") {
+    if (!transferState) return;
+    transferState.blockedAssets++;
+
+    const typeLabel = contentType || this.t("common.noContentType");
+    const extensionLabel = extension || this.t("common.noExtension");
+    const label = `${typeLabel} / ${extensionLabel}`;
+    if (!transferState.blockedAssetTypes.includes(label) && transferState.blockedAssetTypes.length < 5) {
+      transferState.blockedAssetTypes.push(label);
+    }
+  }
+
+  showBlockedAssetsNotice(transferState) {
+    if (!transferState?.blockedAssets) return;
+
+    const count = transferState.blockedAssets;
+    const suffix = count === 1 ? "" : "s";
+    const sample = transferState.blockedAssetTypes.length > 0
+      ? this.t("notices.blockedAssetsSample", { types: transferState.blockedAssetTypes.join(", ") })
+      : "";
+    new Notice(
+      this.t("notices.blockedAssets", { count, suffix, sample }),
+      8000
+    );
   }
 
   async confirmNextPageLoad(label, page, processed, total = Infinity) {
     if (page >= ARENA_MAX_PAGES_PER_RUN) {
-      new Notice(
-        `Importación detenida tras ${ARENA_MAX_PAGES_PER_RUN} páginas. Para cargas más grandes, conviene pedir permiso a Are.na.`
-      );
+      new Notice(this.t("notices.importStopped", { count: ARENA_MAX_PAGES_PER_RUN }));
       return false;
     }
 
     const totalLabel = Number.isFinite(total) ? `${processed}/${total}` : `${processed}`;
-    return window.confirm(
-      `Are.na recomienda cargar páginas bajo demanda. Ya se procesó la página ${page} de ${label} (${totalLabel}). ¿Cargar la siguiente página?`
-    );
+    return new Promise((resolve) => {
+      new ConfirmModal(
+        this.app,
+        this.t("notices.confirmNextPage", { page, label, total: totalLabel }),
+        resolve,
+        {
+          t: this.t,
+        }
+      ).open();
+    });
   }
 
   canDownloadMoreAssets(transferState) {
@@ -450,9 +684,7 @@ class ArenaManagerPlugin extends Plugin {
 
     if (!transferState.assetLimitNoticeShown) {
       transferState.assetLimitNoticeShown = true;
-      new Notice(
-        `Se alcanzó el límite de ${ARENA_MAX_ASSET_DOWNLOADS_PER_RUN} adjuntos locales en esta ejecución. El resto quedará enlazado en remoto para evitar descargas masivas.`
-      );
+      new Notice(this.t("notices.assetLimitReached", { count: ARENA_MAX_ASSET_DOWNLOADS_PER_RUN }));
     }
 
     return false;
@@ -483,14 +715,60 @@ class ArenaManagerPlugin extends Plugin {
       "image/png": ".png",
       "image/gif": ".gif",
       "image/webp": ".webp",
-      "image/svg+xml": ".svg",
       "application/pdf": ".pdf",
+      "application/epub+zip": ".epub",
       "text/plain": ".txt",
-      "application/zip": ".zip",
+      "text/markdown": ".md",
       "audio/mpeg": ".mp3",
+      "audio/mp4": ".m4a",
+      "audio/x-m4a": ".m4a",
+      "audio/wav": ".wav",
+      "audio/x-wav": ".wav",
+      "audio/webm": ".webm",
+      "audio/ogg": ".ogg",
       "video/mp4": ".mp4",
+      "video/quicktime": ".mov",
+      "video/webm": ".webm",
+      "video/ogg": ".ogg",
     };
     return known[normalized] || "";
+  }
+
+  normalizeContentType(contentType) {
+    return (contentType || "").split(";")[0].trim().toLowerCase();
+  }
+
+  isGenericBinaryContentType(contentType) {
+    return contentType === "application/octet-stream" || contentType === "binary/octet-stream";
+  }
+
+  validateAssetDownload(contentType, url, extension) {
+    const normalizedContentType = this.normalizeContentType(contentType);
+    const normalizedExtension = (extension || "").trim().toLowerCase();
+    const hasAllowedMime = normalizedContentType && ALLOWED_ATTACHMENT_MIME_TYPES.includes(normalizedContentType);
+    const hasAllowedExtension = normalizedExtension && ALLOWED_ATTACHMENT_EXTENSIONS.includes(normalizedExtension);
+
+    if (hasAllowedMime && hasAllowedExtension) {
+      return;
+    }
+
+    if (!normalizedContentType || this.isGenericBinaryContentType(normalizedContentType)) {
+      if (hasAllowedExtension) return;
+      const error = new Error(this.t("notices.attachmentBlocked", {
+        contentType: normalizedContentType || this.t("common.noContentType"),
+        url,
+      }));
+      error.assetBlockedByPolicy = true;
+      error.assetBlockedContentType = normalizedContentType || "";
+      error.assetBlockedExtension = normalizedExtension;
+      throw error;
+    }
+
+    const error = new Error(this.t("notices.attachmentBlockedByPolicy", { contentType: normalizedContentType, url }));
+    error.assetBlockedByPolicy = true;
+    error.assetBlockedContentType = normalizedContentType;
+    error.assetBlockedExtension = normalizedExtension;
+    throw error;
   }
 
   async saveBinaryAsset(path, arrayBuffer) {
@@ -506,18 +784,23 @@ class ArenaManagerPlugin extends Plugin {
     if (!url) return null;
 
     await this.arena.paceRequest();
-    const response = await fetch(url);
-    if (!response.ok) {
-      throw new Error(`No se pudo descargar adjunto (${response.status})`);
+    const response = await requestUrl({
+      url,
+      method: "GET",
+      throw: false,
+    });
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(this.t("notices.attachmentDownloadFailed", { status: response.status }));
     }
 
+    const contentType = getHeaderValue(response.headers, "content-type");
     const extension =
-      this.getFileExtensionFromContentType(response.headers.get("content-type")) ||
+      this.getFileExtensionFromContentType(contentType) ||
       this.getFileExtensionFromUrl(url);
+    this.validateAssetDownload(contentType, url, extension);
     const filename = sanitizeFilename(baseName) + extension;
     const assetPath = normalizePath(`${targetFolder}/${filename}`);
-    const buffer = await response.arrayBuffer();
-    await this.saveBinaryAsset(assetPath, buffer);
+    await this.saveBinaryAsset(assetPath, response.arrayBuffer);
     if (transferState) transferState.downloadedAssets++;
     return assetPath;
   }
@@ -553,7 +836,7 @@ class ArenaManagerPlugin extends Plugin {
         const assetPath = await this.downloadAsset(
           block.image.src,
           assetsFolder,
-          `${block.title || "imagen"}-${block.id}`,
+          `${block.title || this.t("common.image")}-${block.id}`,
           transferState
         );
         const imageSrc = this.getRelativeAssetPath(notePath, assetPath);
@@ -566,13 +849,16 @@ class ArenaManagerPlugin extends Plugin {
         const assetPath = await this.downloadAsset(
           block.attachment.url,
           assetsFolder,
-          `${block.title || "adjunto"}-${block.id}`,
+          `${block.title || this.t("common.attachment")}-${block.id}`,
           transferState
         );
         const attachmentUrl = this.getRelativeAssetPath(notePath, assetPath);
         return blockToContent(block, { attachmentUrl, useObsidianLinks: true });
       }
     } catch (error) {
+      if (error?.assetBlockedByPolicy) {
+        this.trackBlockedAsset(transferState, error.assetBlockedContentType, error.assetBlockedExtension);
+      }
       console.error("asset download error:", error);
     }
 
@@ -603,30 +889,86 @@ class ArenaManagerPlugin extends Plugin {
     });
   }
 
+  async syncFolderToChannel(folder, files, channel, options = {}) {
+    const { forceRepublishAll = false, notice = null } = options;
+    const progressNotice = notice || new Notice(this.t("notices.uploadingNotesProgress", { uploaded: 0, total: files.length }), 0);
+    const shouldHideNotice = !notice;
+
+    try {
+      if (folder.path && channel.slug) this.recordChannelFolder(channel.slug, folder.path);
+      const channelRef = channel.id || channel.slug;
+      let uploaded = 0;
+      let skipped = 0;
+
+      for (const file of files) {
+        progressNotice.setMessage(this.t("notices.uploadingNotesProgress", { uploaded, total: files.length }));
+        const { frontmatter, body } = await this.readNoteState(file);
+        if (isSyncSkipped(frontmatter)) {
+          skipped++;
+          continue;
+        }
+        const { content: publishBody } = this.prepareBodyForArena(body);
+
+        let block = null;
+        const currentChannelSlug = String(channel.slug || channelRef || "").trim();
+        const noteChannelSlug = String(frontmatter.channel || "").trim();
+        const canReuseRemoteBlock = !forceRepublishAll && frontmatter.blockid && (!noteChannelSlug || noteChannelSlug === currentChannelSlug);
+
+        if (canReuseRemoteBlock) {
+          try {
+            block = await this.arena.updateBlock(frontmatter.blockid, publishBody, frontmatter.title || file.basename);
+          } catch (error) {
+            if (!this.isArenaNotFoundError(error)) throw error;
+          }
+        }
+
+        if (!block) {
+          block = await this.arena.pushBlock(channelRef, publishBody, file.basename);
+        }
+
+        this.trackBlockMutation(block, channel.slug);
+        await this.mergeArenaFrontmatter(file, block, channel.slug, frontmatter);
+        uploaded++;
+      }
+
+      const summary = skipped > 0
+        ? this.t("notices.folderUploadSummarySkipped", {
+          uploaded,
+          title: channel.title,
+          skipped,
+          flag: SYNC_SKIP_FLAG,
+        })
+        : this.t("notices.folderUploadSummary", { uploaded, title: channel.title });
+      new Notice(summary);
+    } finally {
+      if (shouldHideNotice) progressNotice.hide();
+    }
+  }
+
   registerCommands() {
     this.addCommand({
       id: "get-blocks-from-channel",
-      name: "Obtener bloques de un canal",
+      name: this.t("commands.getBlocksFromChannel"),
       callback: () => this.cmdGetBlocksFromChannel(),
     });
     this.addCommand({
       id: "browse-my-channels",
-      name: "Explorar mis canales",
+      name: this.t("commands.browseMyChannels"),
       callback: () => this.cmdBrowseMyChannels(),
     });
     this.addCommand({
       id: "create-channel",
-      name: "Crear canal en Are.na",
+      name: this.t("commands.createChannel"),
       callback: () => this.cmdCreateChannel(),
     });
     this.addCommand({
       id: "refresh-channels-cache",
-      name: "Actualizar lista de canales (refresco)",
+      name: this.t("commands.refreshChannelsCache"),
       callback: () => this.cmdRefreshChannelsCache(),
     });
     this.addCommand({
       id: "pull-block",
-      name: "Actualizar nota desde Are.na (Pull)",
+      name: this.t("commands.pullBlock"),
       checkCallback: (checking) => {
         const file = this.app.workspace.getActiveFile();
         if (file) {
@@ -637,7 +979,7 @@ class ArenaManagerPlugin extends Plugin {
     });
     this.addCommand({
       id: "push-note",
-      name: "Enviar nota a Are.na (Push)",
+      name: this.t("commands.pushNote"),
       checkCallback: (checking) => {
         const file = this.app.workspace.getActiveFile();
         if (file) {
@@ -648,12 +990,12 @@ class ArenaManagerPlugin extends Plugin {
     });
     this.addCommand({
       id: "get-block-by-id",
-      name: "Obtener bloque por ID o URL",
+      name: this.t("commands.getBlockById"),
       callback: () => this.cmdGetBlockById(),
     });
     this.addCommand({
       id: "open-block-in-arena",
-      name: "Abrir bloque en Are.na",
+      name: this.t("commands.openBlockInArena"),
       checkCallback: (checking) => {
         const file = this.app.workspace.getActiveFile();
         if (file) {
@@ -670,7 +1012,7 @@ class ArenaManagerPlugin extends Plugin {
         if (!(file instanceof TFolder)) return;
         menu.addItem((item) => {
           item
-            .setTitle("Subir carpeta como canal a Are.na")
+            .setTitle(this.t("commands.uploadFolderAsChannel"))
             .setIcon("upload")
             .onClick(() => this.cmdUploadFolderAsChannel(file));
         });
@@ -680,27 +1022,34 @@ class ArenaManagerPlugin extends Plugin {
 
   async cmdGetBlocksFromChannel() {
     if (!this.checkSettings()) return;
-    new InputModal(this.app, "Obtener bloques de canal", "slug o URL del canal", async (input) => {
-      const slug = this.extractSlug(input);
-      await this.fetchAndSaveChannel(slug);
-    }).open();
+    new InputModal(
+      this.app,
+      this.t("prompts.getBlocksFromChannelTitle"),
+      this.t("prompts.getBlocksFromChannelPlaceholder"),
+      async (input) => {
+        const slug = this.extractSlug(input);
+        await this.fetchAndSaveChannel(slug);
+      },
+      { submitText: this.t("common.accept") }
+    ).open();
   }
 
   async cmdBrowseMyChannels() {
     if (!this.checkSettings()) return;
     if (!this.settings.username) {
-      new Notice("⚠️ Configura tu nombre de usuario en los ajustes.");
+      new Notice(this.t("notices.usernameMissing"));
       return;
     }
     try {
       const channelState = await this.getSelectableChannels();
       if (channelState.channels.length === 0) {
-        new Notice("No se encontraron canales.");
+        new Notice(this.t("notices.noChannelsFound"));
         return;
       }
       new ChannelSelectModal(this.app, channelState.channels, async (channel) => {
         await this.fetchAndSaveChannel(channel.slug);
       }, {
+        t: this.t,
         hasMore: channelState.hasMore,
         totalChannels: channelState.total,
         onLoadMore: async () => this.loadMoreSelectableChannels(),
@@ -712,7 +1061,7 @@ class ArenaManagerPlugin extends Plugin {
       }).open();
     } catch (error) {
       console.error("getUserChannels error:", error);
-      new Notice(`❌ Error al cargar canales: ${error.message}`);
+      new Notice(this.t("notices.errorLoadingChannels", { error: error.message }));
     }
   }
 
@@ -723,76 +1072,79 @@ class ArenaManagerPlugin extends Plugin {
         const channel = await this.arena.createChannel(title, visibility);
         this.trackChannelMutation(channel);
         await this.persistData();
-        new Notice(`✅ Canal "${channel.title}" creado en Are.na`);
+        new Notice(this.t("notices.channelCreated", { title: channel.title }));
       } catch (error) {
-        new Notice(`❌ Error al crear canal: ${error.message}`);
+        new Notice(this.t("notices.errorCreatingChannel", { error: error.message }));
       }
-    }).open();
+    }, "", { t: this.t }).open();
   }
 
   async cmdRefreshChannelsCache() {
     if (!this.checkSettings()) return;
     this.invalidateUserChannelCaches();
     await this.persistData();
-    new Notice("Caché de canales borrado. El próximo 'Explorar mis canales' lo descargará de nuevo.");
+    new Notice(this.t("notices.channelsCacheCleared"));
   }
 
   async cmdUploadFolderAsChannel(folder) {
     if (!this.checkSettings()) return;
     const files = folder.children.filter((file) => file instanceof TFile && file.extension === "md");
     if (files.length === 0) {
-      new Notice("⚠️ La carpeta no contiene notas .md.");
+      new Notice(this.t("notices.folderHasNoNotes"));
       return;
     }
+    const linkedChannelSlug = await this.getFolderLinkedChannelSlug(folder, files);
+    if (linkedChannelSlug) {
+      try {
+        const existingChannel = await this.getArenaJson(`/channels/${linkedChannelSlug}`);
+        new Notice(this.t("notices.folderAlreadyLinkedChannel", { channel: linkedChannelSlug }));
+        await this.syncFolderToChannel(folder, files, existingChannel);
+        await this.persistData();
+        return;
+      } catch (error) {
+        if (!this.isArenaNotFoundError(error)) {
+          new Notice(this.t("notices.genericError", { error: error.message }));
+          return;
+        }
+        this.forgetDeletedChannel(linkedChannelSlug, folder.path);
+        await this.persistData();
+        new Notice(this.t("notices.folderLinkedChannelDeleted", { channel: linkedChannelSlug }));
+      }
+    }
+
     new CreateChannelModal(this.app, async (title, visibility) => {
-      const notice = new Notice(`Creando canal "${title}"…`, 0);
+      const notice = new Notice(this.t("notices.creatingChannel", { title }), 0);
       try {
         const channel = await this.arena.createChannel(title, visibility);
         this.trackChannelMutation(channel);
-        const channelRef = channel.id || channel.slug;
-        let uploaded = 0;
-        let skipped = 0;
-        for (const file of files) {
-          notice.setMessage(`Subiendo notas… ${uploaded}/${files.length}`);
-          const { frontmatter, body } = await this.readNoteState(file);
-          if (isSyncSkipped(frontmatter)) {
-            skipped++;
-            continue;
-          }
-          if (frontmatter.blockid) {
-            const block = await this.arena.updateBlock(frontmatter.blockid, body, frontmatter.title || file.basename);
-            this.trackBlockMutation(block, channel.slug);
-          } else {
-            const block = await this.arena.pushBlock(channelRef, body, file.basename);
-            this.trackBlockMutation(block, channel.slug);
-            await this.mergeArenaFrontmatter(file, block, channel.slug, frontmatter);
-          }
-          uploaded++;
-        }
+        await this.syncFolderToChannel(folder, files, channel, {
+          forceRepublishAll: Boolean(linkedChannelSlug),
+          notice,
+        });
         notice.hide();
-        const summary = skipped > 0
-          ? `✅ ${uploaded} notas subidas al canal "${channel.title}" · ${skipped} omitidas por ${SYNC_SKIP_FLAG}`
-          : `✅ ${uploaded} notas subidas al canal "${channel.title}"`;
-        new Notice(summary);
         await this.persistData();
       } catch (error) {
         notice.hide();
-        new Notice(`❌ Error: ${error.message}`);
+        new Notice(this.t("notices.genericError", { error: error.message }));
       }
-    }, folder.name).open();
+    }, folder.name, { t: this.t }).open();
   }
 
   async cmdPullBlock() {
     const file = this.app.workspace.getActiveFile();
     if (!file) return;
-    const { content, frontmatter } = await this.readNoteState(file);
+    const { content, body, frontmatter } = await this.readNoteState(file);
     if (isSyncSkipped(frontmatter)) {
-      new Notice(`⚠️ Esta nota está marcada con ${SYNC_SKIP_FLAG}: true.`);
+      new Notice(this.t("notices.noteMarkedSkipped", { flag: SYNC_SKIP_FLAG }));
       return;
     }
     const blockId = frontmatter.blockid;
     if (!blockId) {
-      new Notice("⚠️ Esta nota no tiene blockid en el frontmatter.");
+      new Notice(this.t("notices.noteMissingBlockIdFrontmatter"));
+      return;
+    }
+    if (this.noteHasPublishOnlyContent(body)) {
+      new Notice(this.t("notices.pullSkippedToProtectLocalOnlyMarkdown"), 8000);
       return;
     }
     try {
@@ -806,9 +1158,13 @@ class ArenaManagerPlugin extends Plugin {
       );
       await this.app.vault.modify(file, replaceBodyPreservingFrontmatter(content, newBody));
       await this.mergeArenaFrontmatter(file, block, frontmatter.channel || "", frontmatter);
-      new Notice(`✅ Nota actualizada desde bloque ${blockId}`);
+      if (frontmatter.channel && file.parent?.path) {
+        this.recordChannelFolder(frontmatter.channel, file.parent.path);
+      }
+      new Notice(this.t("notices.noteUpdatedFromBlock", { id: blockId }));
+      this.showBlockedAssetsNotice(transferState);
     } catch (error) {
-      new Notice(`❌ Error: ${error.message}`);
+      new Notice(this.t("notices.genericError", { error: error.message }));
     }
   }
 
@@ -817,30 +1173,49 @@ class ArenaManagerPlugin extends Plugin {
     if (!file) return;
     const { body, frontmatter } = await this.readNoteState(file);
     if (isSyncSkipped(frontmatter)) {
-      new Notice(`⚠️ Esta nota está marcada con ${SYNC_SKIP_FLAG}: true.`);
+      new Notice(this.t("notices.noteMarkedSkipped", { flag: SYNC_SKIP_FLAG }));
       return;
     }
     const blockId = frontmatter.blockid;
     const title = frontmatter.title || file.basename;
+    const { content: publishBody } = this.prepareBodyForArena(body);
     if (blockId) {
       try {
-        const block = await this.arena.updateBlock(blockId, body, title);
+        const block = await this.arena.updateBlock(blockId, publishBody, title);
         this.trackBlockMutation(block, frontmatter.channel || "");
+        await this.mergeArenaFrontmatter(file, block, frontmatter.channel || "", frontmatter);
+        if (frontmatter.channel && file.parent?.path) {
+          this.recordChannelFolder(frontmatter.channel, file.parent.path);
+        }
         await this.persistData();
-        new Notice(`✅ Bloque ${blockId} actualizado en Are.na`);
+        new Notice(this.t("notices.blockUpdated", { id: blockId }));
       } catch (error) {
-        new Notice(`❌ Error al actualizar: ${error.message}`);
+        if (this.isArenaNotFoundError(error)) {
+          if (frontmatter.channel) {
+            await this.publishNoteToArena(file, frontmatter, publishBody, title, frontmatter.channel, frontmatter.channel);
+            return;
+          }
+          await this.promptPushNoteChannel(file, { ...frontmatter, blockid: null }, publishBody, title);
+          return;
+        }
+        new Notice(this.t("notices.genericError", { error: error.message }));
       }
     } else {
-      await this.promptPushNoteChannel(file, frontmatter, body, title);
+      await this.promptPushNoteChannel(file, frontmatter, publishBody, title);
     }
   }
 
   async promptPushNoteChannel(file, frontmatter, body, title) {
     const openManualInput = () => {
-      new InputModal(this.app, "Enviar a Are.na", "slug del canal destino", async (slug) => {
-        await this.publishNoteToArena(file, frontmatter, body, title, slug, slug);
-      }).open();
+      new InputModal(
+        this.app,
+        this.t("prompts.pushToArenaTitle"),
+        this.t("prompts.pushToArenaPlaceholder"),
+        async (slug) => {
+          await this.publishNoteToArena(file, frontmatter, body, title, slug, slug);
+        },
+        { submitText: this.t("common.accept") }
+      ).open();
     };
 
     if (!this.settings.username) {
@@ -859,12 +1234,13 @@ class ArenaManagerPlugin extends Plugin {
         const channelSlug = channel.slug || String(channelRef);
         await this.publishNoteToArena(file, frontmatter, body, title, channelRef, channelSlug);
       }, {
-        title: "Selecciona el canal destino",
+        t: this.t,
+        title: this.t("prompts.selectDestinationChannel"),
         hasMore: channelState.hasMore,
         totalChannels: channelState.total,
         onLoadMore: async () => this.loadMoreSelectableChannels(),
         onManualInput: openManualInput,
-        manualButtonText: "Introducir slug manual",
+        manualButtonText: this.t("prompts.manualSlugInput"),
         onRefresh: async () => {
           this.invalidateUserChannelCaches();
           await this.persistData();
@@ -873,7 +1249,7 @@ class ArenaManagerPlugin extends Plugin {
       }).open();
     } catch (error) {
       console.error("push-note channels error:", error);
-      new Notice(`⚠️ No se pudo cargar la lista de canales: ${error.message}`);
+      new Notice(this.t("notices.warningLoadingChannelList", { error: error.message }));
       openManualInput();
     }
   }
@@ -883,29 +1259,42 @@ class ArenaManagerPlugin extends Plugin {
       const block = await this.arena.pushBlock(channelRef, body, title);
       this.trackBlockMutation(block, channelSlug);
       await this.mergeArenaFrontmatter(file, block, channelSlug, frontmatter);
+      if (file.parent?.path) this.recordChannelFolder(channelSlug, file.parent.path);
       await this.persistData();
-      new Notice(`✅ Publicado en /${channelSlug} como bloque ${block.id}`);
+      new Notice(this.t("notices.notePublished", { channel: channelSlug, id: block.id }));
     } catch (error) {
-      new Notice(`❌ Error al publicar: ${error.message}`);
+      new Notice(this.t("notices.genericError", { error: error.message }));
     }
   }
 
   async cmdGetBlockById() {
     if (!this.checkSettings()) return;
-    new InputModal(this.app, "Obtener bloque por ID o URL", "ID numérico o URL de Are.na", async (input) => {
-      const id = this.extractBlockId(input);
-      if (!id) {
-        new Notice("⚠️ No se pudo extraer el ID.");
-        return;
-      }
-      try {
-        const block = await this.arena.getBlock(id);
-        await this.saveBlock(block, "", null, null, this.createTransferState());
-        new Notice(`✅ Bloque ${id} importado`);
-      } catch (error) {
-        new Notice(`❌ Error: ${error.message}`);
-      }
-    }).open();
+    new InputModal(
+      this.app,
+      this.t("prompts.getBlockByIdTitle"),
+      this.t("prompts.getBlockByIdPlaceholder"),
+      async (input) => {
+        const id = this.extractBlockId(input);
+        if (!id) {
+          new Notice(this.t("notices.couldNotExtractBlockId"));
+          return;
+        }
+        try {
+          const block = await this.arena.getBlock(id);
+          const transferState = this.createTransferState();
+          const result = await this.saveBlock(block, "", null, null, transferState);
+          if (!result.written && result.reason === "local_publish_only") {
+            new Notice(this.t("notices.blockImportSkippedToProtectLocalOnlyMarkdown"), 8000);
+            return;
+          }
+          new Notice(this.t("notices.blockImported", { id }));
+          this.showBlockedAssetsNotice(transferState);
+        } catch (error) {
+          new Notice(this.t("notices.genericError", { error: error.message }));
+        }
+      },
+      { submitText: this.t("common.accept") }
+    ).open();
   }
 
   async cmdOpenInArena() {
@@ -915,7 +1304,7 @@ class ArenaManagerPlugin extends Plugin {
     const blockId = frontmatter.blockid;
     const channel = frontmatter.channel;
     if (!blockId) {
-      new Notice("⚠️ Esta nota no tiene blockid.");
+      new Notice(this.t("notices.noteMissingBlockId"));
       return;
     }
     const url = channel
@@ -925,17 +1314,17 @@ class ArenaManagerPlugin extends Plugin {
   }
 
   async fetchAndSaveChannel(slug) {
-    new Notice(`Descargando canal "${slug}"…`);
+    new Notice(this.t("notices.downloadingChannel", { slug }));
     try {
       const transferState = this.createTransferState();
       const channel = await this.getArenaJson(`/channels/${slug}`);
       const channelTitle = channel.title || slug;
-      const folderName = sanitizeFolderName(channelTitle) || slug;
-      const folder = normalizePath(`${this.settings.folder}/${folderName}`);
+      const { blockIndex, channelFolders } = await this.buildVaultIndexes();
+      const folder = this.resolveChannelFolder(slug, channelTitle, channelFolders);
       await this.ensureFolder(folder);
-      const blockIndex = await this.buildBlockFileIndex();
       let saved = 0;
-      let skipped = 0;
+      let skippedByFlag = 0;
+      let skippedToProtectLocalOnly = 0;
       let page = 1;
 
       while (true) {
@@ -944,22 +1333,32 @@ class ArenaManagerPlugin extends Plugin {
 
         for (const block of blocks) {
           if (block.type === "Channel") continue;
-          const written = await this.saveBlock(block, slug, folder, blockIndex, transferState);
-          if (written) saved++;
-          else skipped++;
+          const result = await this.saveBlock(block, slug, folder, blockIndex, transferState);
+          if (result.written) saved++;
+          else if (result.reason === "sync_skip") skippedByFlag++;
+          else if (result.reason === "local_publish_only") skippedToProtectLocalOnly++;
         }
 
         if (!data.meta?.has_more_pages) break;
-        if (!await this.confirmNextPageLoad(`"${channelTitle}"`, page, saved + skipped, data.meta?.total_count)) break;
+        if (!await this.confirmNextPageLoad(`"${channelTitle}"`, page, saved + skippedByFlag + skippedToProtectLocalOnly, data.meta?.total_count)) break;
         page++;
       }
 
-      const summary = skipped > 0
-        ? `✅ "${channelTitle}": ${saved} bloques importados · ${skipped} omitidos por ${SYNC_SKIP_FLAG}`
-        : `✅ "${channelTitle}": ${saved} bloques importados`;
+      const summary = skippedByFlag > 0
+        ? this.t("notices.channelImportSummarySkipped", {
+          title: channelTitle,
+          saved,
+          skipped: skippedByFlag,
+          flag: SYNC_SKIP_FLAG,
+        })
+        : this.t("notices.channelImportSummary", { title: channelTitle, saved });
       new Notice(summary);
+      if (skippedToProtectLocalOnly > 0) {
+        new Notice(this.t("notices.channelImportProtectedLocalOnlyMarkdown", { count: skippedToProtectLocalOnly }), 8000);
+      }
+      this.showBlockedAssetsNotice(transferState);
     } catch (error) {
-      new Notice(`❌ Error: ${error.message}`);
+      new Notice(this.t("notices.genericError", { error: error.message }));
     } finally {
       if (this.cacheDirty) await this.persistData();
     }
@@ -968,7 +1367,7 @@ class ArenaManagerPlugin extends Plugin {
   async saveBlock(block, channelSlug, folder = null, blockIndex = null, transferState = null) {
     const targetFolder = folder || normalizePath(this.settings.folder);
     await this.ensureFolder(targetFolder);
-    const noteTitle = sanitizeFilename(block.title || `Bloque ${block.id}`);
+    const noteTitle = sanitizeFilename(block.title || `${this.t("common.block")} ${block.id}`);
     const index = blockIndex || await this.buildBlockFileIndex();
     const blockKey = String(block.id);
     const preferredPath = normalizePath(`${targetFolder}/${noteTitle}.md`);
@@ -986,13 +1385,19 @@ class ArenaManagerPlugin extends Plugin {
     }
 
     if (existing instanceof TFile) {
-      const { content: raw, frontmatter } = await this.readNoteState(existing);
-      if (isSyncSkipped(frontmatter)) return false;
+      const { content: raw, body: localBody, frontmatter } = await this.readNoteState(existing);
+      if (isSyncSkipped(frontmatter)) return { written: false, reason: "sync_skip" };
+      if (this.noteHasPublishOnlyContent(localBody)) {
+        return { written: false, reason: "local_publish_only" };
+      }
       const body = await this.buildImportedBlockContent(block, targetFolder, existing.path, transferState);
       await this.app.vault.modify(existing, replaceBodyPreservingFrontmatter(raw, body));
       await this.mergeArenaFrontmatter(existing, block, channelSlug, frontmatter);
+      if (channelSlug && existing.parent?.path) {
+        this.recordChannelFolder(channelSlug, existing.parent.path);
+      }
       index.set(blockKey, existing);
-      return true;
+      return { written: true, reason: "" };
     }
 
     const frontmatterYaml = frontmatterObjectToYaml(getArenaFrontmatter(block, channelSlug));
@@ -1002,8 +1407,9 @@ class ArenaManagerPlugin extends Plugin {
     const body = await this.buildImportedBlockContent(block, targetFolder, filename, transferState);
     const noteContent = `${frontmatterYaml}\n\n${body}`;
     const createdFile = await this.app.vault.create(filename, noteContent);
+    if (channelSlug) this.recordChannelFolder(channelSlug, targetFolder);
     index.set(blockKey, createdFile);
-    return true;
+    return { written: true, reason: "" };
   }
 
   async ensureFolder(path) {
@@ -1030,7 +1436,7 @@ class ArenaManagerPlugin extends Plugin {
 
   checkSettings() {
     if (!this.settings.token) {
-      new Notice("⚠️ Configura tu Personal Access Token en los ajustes del plugin.");
+      new Notice(this.t("notices.configureToken"));
       return false;
     }
     return true;
@@ -1046,14 +1452,19 @@ class ArenaSettingsTab extends PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "Are.na Bridge" });
+    containerEl.createEl("h2", { text: this.plugin.t("settings.title") });
 
     new Setting(containerEl)
-      .setName("Personal Access Token")
-      .setDesc("Obtén tu token en are.na/settings/oauth. Para Push y crear canales, usa scope write.")
+      .setName(this.plugin.t("settings.tokenName"))
+      .setDesc(this.plugin.t("settings.tokenDesc"))
       .addText((text) =>
         text
-          .setPlaceholder("Tu token de Are.na")
+          .then(() => {
+            text.inputEl.type = "password";
+            text.inputEl.autocomplete = "off";
+            text.inputEl.spellcheck = false;
+          })
+          .setPlaceholder(this.plugin.t("settings.tokenPlaceholder"))
           .setValue(this.plugin.settings.token)
           .onChange(async (value) => {
             this.plugin.settings.token = value.trim();
@@ -1062,11 +1473,11 @@ class ArenaSettingsTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Usuario (slug)")
-      .setDesc("Tu slug de Are.na, ej. 'marco-noris'")
+      .setName(this.plugin.t("settings.usernameName"))
+      .setDesc(this.plugin.t("settings.usernameDesc"))
       .addText((text) =>
         text
-          .setPlaceholder("tu-usuario")
+          .setPlaceholder(this.plugin.t("settings.usernamePlaceholder"))
           .setValue(this.plugin.settings.username)
           .onChange(async (value) => {
             this.plugin.settings.username = value.trim();
@@ -1075,8 +1486,25 @@ class ArenaSettingsTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Carpeta")
-      .setDesc("Carpeta del vault donde se guardarán los bloques")
+      .setName(this.plugin.t("settings.languageName"))
+      .setDesc(this.plugin.t("settings.languageDesc"))
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption(LANGUAGE_PREFERENCE_AUTO, this.plugin.t("settings.languageAuto"))
+          .addOption("en", this.plugin.t("settings.languageEnglish"))
+          .addOption("es", this.plugin.t("settings.languageSpanish"))
+          .setValue(this.plugin.settings.language || LANGUAGE_PREFERENCE_AUTO)
+          .onChange(async (value) => {
+            this.plugin.settings.language = value;
+            await this.plugin.saveSettings();
+            this.display();
+            new Notice(this.plugin.t("notices.languageChanged"));
+          })
+      );
+
+    new Setting(containerEl)
+      .setName(this.plugin.t("settings.folderName"))
+      .setDesc(this.plugin.t("settings.folderDesc"))
       .addText((text) =>
         text
           .setPlaceholder(DEFAULT_FOLDER)
@@ -1088,8 +1516,8 @@ class ArenaSettingsTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Descargar adjuntos")
-      .setDesc("Descarga automáticamente archivos adjuntos")
+      .setName(this.plugin.t("settings.downloadAttachmentsName"))
+      .setDesc(this.plugin.t("settings.downloadAttachmentsDesc"))
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.downloadAttachments)
@@ -1100,8 +1528,8 @@ class ArenaSettingsTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Carpeta de adjuntos")
-      .setDesc("Nombre de la carpeta local donde se guardan imágenes y adjuntos descargados")
+      .setName(this.plugin.t("settings.attachmentsFolderName"))
+      .setDesc(this.plugin.t("settings.attachmentsFolderDesc"))
       .addText((text) =>
         text
           .setPlaceholder("_assets")
@@ -1112,45 +1540,67 @@ class ArenaSettingsTab extends PluginSettingTab {
           })
       );
 
-    containerEl.createEl("h3", { text: "Diagnóstico de caché" });
-    const diagnostics = this.plugin.getCacheDiagnostics();
-    const summary = [
-      `${diagnostics.total} respuestas API`,
-      `${diagnostics.users} de usuario`,
-      `${diagnostics.channels} de canales`,
-      `${diagnostics.blocks} de bloques`,
-      `${diagnostics.other} de otros endpoints`,
-      `${diagnostics.localChannels} canales en lista local`,
-    ].join(" · ");
+    new Setting(containerEl)
+      .setName(this.plugin.t("settings.publishCodeBlockFilterName"))
+      .setDesc(this.plugin.t("settings.publishCodeBlockFilterDesc"))
+      .addText((text) =>
+        text
+          .setPlaceholder("dataview, mermaid")
+          .setValue(this.plugin.settings.publishCodeBlockFilter || "")
+          .onChange(async (value) => {
+            this.plugin.settings.publishCodeBlockFilter = value
+              .split(",")
+              .map((part) => normalizeCodeFenceLanguage(part))
+              .filter(Boolean)
+              .join(", ");
+            await this.plugin.saveSettings();
+          })
+      );
 
     new Setting(containerEl)
-      .setName("Estado de la caché")
+      .setName(this.plugin.t("settings.publishStripCalloutsName"))
+      .setDesc(this.plugin.t("settings.publishStripCalloutsDesc"))
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.publishStripCallouts)
+          .onChange(async (value) => {
+            this.plugin.settings.publishStripCallouts = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    containerEl.createEl("h3", { text: this.plugin.t("settings.cacheDiagnosticsTitle") });
+    const diagnostics = this.plugin.getCacheDiagnostics();
+    const summary = this.plugin.t("settings.cacheStatusSummary", diagnostics);
+
+    new Setting(containerEl)
+      .setName(this.plugin.t("settings.cacheStatusName"))
       .setDesc(summary)
       .addButton((button) =>
         button
-          .setButtonText("Vaciar canales")
+          .setButtonText(this.plugin.t("settings.clearChannelsButton"))
           .onClick(async () => {
             await this.plugin.clearChannelCaches();
-            new Notice("Caché de usuario/canales vaciada.");
+            new Notice(this.plugin.t("notices.channelCacheCleared"));
             this.display();
           })
       )
       .addButton((button) =>
         button
-          .setButtonText("Vaciar bloques")
+          .setButtonText(this.plugin.t("settings.clearBlocksButton"))
           .onClick(async () => {
             await this.plugin.clearBlockCaches();
-            new Notice("Caché de bloques vaciada.");
+            new Notice(this.plugin.t("notices.blockCacheCleared"));
             this.display();
           })
       )
       .addButton((button) =>
         button
           .setWarning()
-          .setButtonText("Vaciar todo")
+          .setButtonText(this.plugin.t("settings.clearAllButton"))
           .onClick(async () => {
             await this.plugin.clearAllCaches();
-            new Notice("Toda la caché del plugin ha sido vaciada.");
+            new Notice(this.plugin.t("notices.allCacheCleared"));
             this.display();
           })
       );

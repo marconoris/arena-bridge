@@ -2,7 +2,7 @@
 
 Technical notes for the current Are.na Bridge implementation.
 
-Plugin version: `2.0.0`
+Plugin version: `1.0.0`
 
 ## Current Plugin Status
 

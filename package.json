@@ -1,6 +1,6 @@
 {
   "name": "arena-bridge",
-  "version": "2.0.0",
+  "version": "1.0.1-beta.1",
   "private": true,
   "description": "Build setup for the Are.na Bridge Obsidian plugin",
   "scripts": {

@@ -1,9 +1,9 @@
 {
   "id": "arena-bridge",
   "name": "Are.na Bridge",
-  "version": "2.0.0",
+  "version": "1.0.1-beta.1",
   "minAppVersion": "1.0.0",
-  "description": "Conecta tu bóveda de Obsidian con Are.na. Importa bloques y canales, publica notas, sincroniza contenido.",
+  "description": "Connect your Obsidian vault with Are.na. Import blocks and channels, publish notes, and sync content.",
   "author": "Marco Noris",
   "isDesktopOnly": false
 }

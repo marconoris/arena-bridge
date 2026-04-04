@@ -3,7 +3,7 @@
 const { SYNC_SKIP_FLAG } = require("./constants");
 
 function sanitizeFilename(name) {
-  return (name || "Sin titulo")
+  return (name || "Untitled")
     .replace(/[\\/:*?"<>|]/g, "-")
     .replace(/\s+/g, " ")
     .trim()
@@ -11,7 +11,7 @@ function sanitizeFilename(name) {
 }
 
 function sanitizeFolderName(name) {
-  return (name || "Sin titulo")
+  return (name || "Untitled")
     .replace(/[\\/:*?"<>|]/g, "-")
     .replace(/\s+/g, " ")
     .trim()
@@ -110,7 +110,7 @@ function blockToContent(block, options = {}) {
     const attachmentUrl = options.attachmentUrl || block.attachment?.url;
     if (attachmentUrl) {
       if (options.useObsidianLinks) parts.push(`[[${attachmentUrl}]]`);
-      else parts.push(`[${block.title || "Adjunto"}](${attachmentUrl})`);
+      else parts.push(`[${block.title || "Attachment"}](${attachmentUrl})`);
     }
     const description = extractText(block.description);
     if (description) parts.push("\n" + description);
@@ -162,6 +162,110 @@ function replaceBodyPreservingFrontmatter(noteContent, body) {
     : `---\n${frontmatterRaw}\n---\n`;
 }
 
+function normalizeCodeFenceLanguage(infoString = "") {
+  const normalized = String(infoString || "").trim().toLowerCase();
+  if (!normalized) return "";
+
+  const token = normalized.split(/\s+/)[0] || "";
+  return token.replace(/^\{+/, "").replace(/\}+$/, "");
+}
+
+function isCodeFenceClose(line, marker, size) {
+  const trimmed = String(line || "").trim();
+  if (!trimmed) return false;
+  return new RegExp(`^\\${marker}{${size},}\\s*$`).test(trimmed);
+}
+
+function filterMarkdownCodeBlocks(noteContent, excludedLanguages = []) {
+  const source = String(noteContent || "");
+  if (!source.trim()) return { content: source, removedBlocks: 0 };
+
+  const excluded = new Set(
+    (Array.isArray(excludedLanguages) ? excludedLanguages : [])
+      .map((language) => normalizeCodeFenceLanguage(language))
+      .filter(Boolean)
+  );
+  if (excluded.size === 0) return { content: source, removedBlocks: 0 };
+
+  const lines = source.split(/\r?\n/);
+  const result = [];
+  let removedBlocks = 0;
+  let activeFence = null;
+
+  for (const line of lines) {
+    if (!activeFence) {
+      const match = String(line).match(/^\s*(`{3,}|~{3,})(.*)$/);
+      if (!match) {
+        result.push(line);
+        continue;
+      }
+
+      const fence = match[1];
+      const language = normalizeCodeFenceLanguage(match[2]);
+      const excludedFence = language && excluded.has(language);
+      activeFence = {
+        marker: fence[0],
+        size: fence.length,
+        excluded: excludedFence,
+      };
+      if (excludedFence) {
+        removedBlocks++;
+        continue;
+      }
+      result.push(line);
+      continue;
+    }
+
+    if (isCodeFenceClose(line, activeFence.marker, activeFence.size)) {
+      const shouldKeepCloseFence = !activeFence.excluded;
+      activeFence = null;
+      if (shouldKeepCloseFence) result.push(line);
+      continue;
+    }
+
+    if (!activeFence.excluded) result.push(line);
+  }
+
+  return { content: result.join("\n"), removedBlocks };
+}
+
+function isMarkdownCalloutStart(line) {
+  return /^\s*>\s*\[![^\]]+\][+-]?\s*/i.test(String(line || ""));
+}
+
+function isMarkdownBlockquoteLine(line) {
+  return /^\s*>/.test(String(line || ""));
+}
+
+function filterMarkdownCallouts(noteContent, { stripCallouts = false } = {}) {
+  const source = String(noteContent || "");
+  if (!source.trim() || !stripCallouts) return { content: source, removedCallouts: 0 };
+
+  const lines = source.split(/\r?\n/);
+  const result = [];
+  let removedCallouts = 0;
+  let insideCallout = false;
+
+  for (const line of lines) {
+    if (!insideCallout) {
+      if (isMarkdownCalloutStart(line)) {
+        insideCallout = true;
+        removedCallouts++;
+        continue;
+      }
+      result.push(line);
+      continue;
+    }
+
+    if (isMarkdownBlockquoteLine(line)) continue;
+
+    insideCallout = false;
+    result.push(line);
+  }
+
+  return { content: result.join("\n"), removedCallouts };
+}
+
 module.exports = {
   sanitizeFilename,
   sanitizeFolderName,
@@ -172,4 +276,7 @@ module.exports = {
   splitNoteContent,
   extractFrontmatterScalar,
   replaceBodyPreservingFrontmatter,
+  normalizeCodeFenceLanguage,
+  filterMarkdownCodeBlocks,
+  filterMarkdownCallouts,
 };

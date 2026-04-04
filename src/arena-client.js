@@ -1,9 +1,27 @@
 "use strict";
 
+const { requestUrl } = require("obsidian");
 const { ARENA_API, ARENA_PAGE_SIZE, ARENA_REQUEST_DELAY_MS } = require("./constants");
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getHeaderValue(headers = {}, name) {
+  const target = String(name || "").toLowerCase();
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (String(key).toLowerCase() === target) return String(value);
+  }
+  return "";
+}
+
+function parseJsonSafely(text) {
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
 }
 
 class ArenaClient {
@@ -16,7 +34,6 @@ class ArenaClient {
 
   headers() {
     return {
-      "Content-Type": "application/json",
       Authorization: `Bearer ${this.token}`,
     };
   }
@@ -27,11 +44,11 @@ class ArenaClient {
     this.lastRequestAt = Date.now();
   }
 
-  getRetryDelayMs(res, attempt) {
-    const retryAfter = parseInt(res.headers.get("Retry-After") || "", 10);
+  getRetryDelayMs(headers, attempt) {
+    const retryAfter = parseInt(getHeaderValue(headers, "Retry-After") || "", 10);
     if (Number.isFinite(retryAfter) && retryAfter > 0) return retryAfter * 1000;
 
-    const reset = parseInt(res.headers.get("X-RateLimit-Reset") || "", 10);
+    const reset = parseInt(getHeaderValue(headers, "X-RateLimit-Reset") || "", 10);
     if (Number.isFinite(reset) && reset > 0) {
       return Math.max((reset * 1000) - Date.now(), 1000);
     }
@@ -43,33 +60,50 @@ class ArenaClient {
     let lastStatus = 0;
     for (let attempt = 0; attempt < 3; attempt++) {
       await this.paceRequest();
-      const res = await fetch(url, options);
-      lastStatus = res.status;
+      const response = await requestUrl({
+        url,
+        method: options.method || "GET",
+        headers: options.headers,
+        body: options.body,
+        contentType: options.contentType,
+        throw: false,
+      });
+      lastStatus = response.status;
 
-      if (res.status === 429) {
-        const waitMs = this.getRetryDelayMs(res, attempt);
+      if (response.status === 429) {
+        const waitMs = this.getRetryDelayMs(response.headers, attempt);
         console.warn(`arena-manager: rate limit, esperando ${waitMs}ms`);
         await sleep(waitMs);
         continue;
       }
 
-      if (requestOptions.allowNotModified && res.status === 304) {
+      if (requestOptions.allowNotModified && response.status === 304) {
         return {
           status: 304,
           data: null,
-          etag: res.headers.get("ETag") || null,
+          etag: getHeaderValue(response.headers, "ETag") || null,
         };
       }
 
-      if (!res.ok) {
-        throw new Error(`Request failed, status ${res.status} — ${url.toString()}`);
+      if (response.status < 200 || response.status >= 300) {
+        const payload = parseJsonSafely(response.text || "");
+        const detail = payload?.details?.message || payload?.error || "";
+        const error = new Error(
+          detail
+            ? `${detail} (${response.status})`
+            : `Request failed, status ${response.status} — ${url.toString()}`
+        );
+        error.status = response.status;
+        error.url = url.toString();
+        error.payload = payload;
+        throw error;
       }
 
-      const text = await res.text();
+      const text = response.text || "";
       return {
-        status: res.status,
+        status: response.status,
         data: text ? JSON.parse(text) : {},
-        etag: res.headers.get("ETag") || null,
+        etag: getHeaderValue(response.headers, "ETag") || null,
       };
     }
 
@@ -86,13 +120,14 @@ class ArenaClient {
     Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
     const headers = this.headers();
     if (etag) headers["If-None-Match"] = etag;
-    return this.requestJson(url.toString(), { headers }, { allowNotModified: true });
+    return this.requestJson(url.toString(), { method: "GET", headers }, { allowNotModified: true });
   }
 
   async post(path, body = {}) {
     const result = await this.requestJson(`${this.base}${path}`, {
       method: "POST",
       headers: this.headers(),
+      contentType: "application/json",
       body: JSON.stringify(body),
     });
     return result.data;
@@ -102,6 +137,7 @@ class ArenaClient {
     const result = await this.requestJson(`${this.base}${path}`, {
       method: "PUT",
       headers: this.headers(),
+      contentType: "application/json",
       body: JSON.stringify(body),
     });
     return result.data;
