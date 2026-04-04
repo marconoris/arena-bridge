@@ -2,6 +2,8 @@
 
 An Obsidian plugin that connects your vault with [Are.na](https://www.are.na). It lets you import channels and blocks, publish notes to Are.na, and keep a lightweight sync flow between both sides.
 
+This plugin was built out of my own need to keep an Obsidian vault and Are.na working together without adding a heavy workflow on top.
+
 > Beta note: mobile support is currently beta. Core flows work, but the mobile UI is still being validated and may have rough edges.
 
 ## Features
@@ -167,6 +169,8 @@ Edit `src/`. `main.js` is the generated bundle.
 Additional API and implementation notes are documented in [`docs/arena-api-notes.md`](docs/arena-api-notes.md).
 
 Public launch preparation is tracked in [`docs/release-checklist.md`](docs/release-checklist.md).
+
+Mobile beta validation is tracked in [`docs/mobile-acceptance-checklist.md`](docs/mobile-acceptance-checklist.md).
 
 ## License
 

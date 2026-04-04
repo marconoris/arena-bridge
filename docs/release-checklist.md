@@ -18,4 +18,5 @@ Checklist for preparing `Are.na Bridge` for a public launch in the Obsidian comm
 ## Launch Strategy
 
 - [ ] Run a short beta through BRAT before submission so external users can catch real vault/API edge cases.
+- [ ] Complete the mobile beta exit criteria in [`docs/mobile-acceptance-checklist.md`](./mobile-acceptance-checklist.md) before removing the beta label.
 - [ ] Decide whether `versions.json` is needed. Add it only if `minAppVersion` changes or if you want to preserve compatibility for older Obsidian versions.
