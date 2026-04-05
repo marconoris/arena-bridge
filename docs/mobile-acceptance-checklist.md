@@ -4,7 +4,7 @@ Minimal acceptance checklist for `Are.na Bridge` mobile support before removing 
 
 Status target for the current phase:
 
-- Mobile support is valid in `1.0.1-beta.1`
+- Mobile support is valid in `1.0.1-beta.2`
 - The beta label stays until this checklist is completed with real-world usage
 
 ## Install and Setup

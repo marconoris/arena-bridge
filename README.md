@@ -19,7 +19,7 @@ This plugin was built out of my own need to keep an Obsidian vault and Are.na wo
 
 ## Status
 
-Current version: `1.0.1-beta.1`
+Current version: `1.0.1-beta.2`
 
 This version uses the Are.na `v3` API with a Personal Access Token.
 
@@ -96,6 +96,14 @@ From the context menu of a vault folder, create a new Are.na channel and upload 
 
 - Notes that already have `blockid` are updated instead of duplicated.
 - New notes receive `blockid` and `channel` in frontmatter.
+- If the folder is already linked to a channel, the same context menu can resync it or pull updates from the linked Are.na channel.
+
+### Context Menu on Desktop
+
+The desktop file explorer context menu now exposes direct actions for both folders and notes:
+
+- Folders: sync the folder with its Are.na channel, or update the folder from the linked channel.
+- Markdown notes: pull the linked block, push the note, or open the block in Are.na.
 
 ### Open Block in Are.na
 

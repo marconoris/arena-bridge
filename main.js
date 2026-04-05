@@ -658,6 +658,8 @@ var require_i18n = __commonJS({
           browseMyChannels: "Browse my channels",
           createChannel: "Create Are.na channel",
           refreshChannelsCache: "Refresh channels list",
+          syncFolderWithChannel: "Sync folder with Are.na channel",
+          updateFolderFromChannel: "Update folder from linked Are.na channel",
           pullBlock: "Update note from Are.na (Pull)",
           pushNote: "Send note to Are.na (Push)",
           getBlockById: "Get block by ID or URL",
@@ -675,7 +677,7 @@ var require_i18n = __commonJS({
           manualSlugInput: "Enter slug manually"
         },
         notices: {
-          pluginLoaded: "Are.na Bridge v1.0.1-beta.1 loaded.",
+          pluginLoaded: "Are.na Bridge v1.0.1-beta.2 loaded.",
           pluginUnloaded: "Are.na Bridge unloaded.",
           loadingYourChannels: "Loading your channels\u2026",
           loadingChannelsPage: "Loading channels\u2026 page {{page}} \xB7 {{total}} found",
@@ -696,6 +698,7 @@ var require_i18n = __commonJS({
           errorCreatingChannel: "Error creating channel: {{error}}",
           channelsCacheCleared: 'Channels cache cleared. The next "Browse my channels" will fetch it again.',
           folderHasNoNotes: "This folder does not contain any `.md` notes.",
+          folderMissingLinkedChannel: "This folder is not linked to a single Are.na channel yet.",
           folderAlreadyLinkedChannel: "This folder is already linked to /{{channel}}. Reusing that channel instead of creating a new one.",
           folderLinkedChannelDeleted: "The linked channel /{{channel}} no longer exists on Are.na. A new channel will be created.",
           creatingChannel: 'Creating channel "{{title}}"\u2026',
@@ -813,6 +816,8 @@ var require_i18n = __commonJS({
           browseMyChannels: "Explorar mis canales",
           createChannel: "Crear canal en Are.na",
           refreshChannelsCache: "Actualizar lista de canales (refresco)",
+          syncFolderWithChannel: "Sincronizar carpeta con canal de Are.na",
+          updateFolderFromChannel: "Actualizar carpeta desde el canal vinculado de Are.na",
           pullBlock: "Actualizar nota desde Are.na (Pull)",
           pushNote: "Enviar nota a Are.na (Push)",
           getBlockById: "Obtener bloque por ID o URL",
@@ -830,7 +835,7 @@ var require_i18n = __commonJS({
           manualSlugInput: "Introducir slug manual"
         },
         notices: {
-          pluginLoaded: "Are.na Bridge v1.0.1-beta.1 cargado.",
+          pluginLoaded: "Are.na Bridge v1.0.1-beta.2 cargado.",
           pluginUnloaded: "Are.na Bridge descargado.",
           loadingYourChannels: "Cargando tus canales\u2026",
           loadingChannelsPage: "Cargando canales\u2026 p\xE1g. {{page}} \xB7 {{total}} encontrados",
@@ -851,6 +856,7 @@ var require_i18n = __commonJS({
           errorCreatingChannel: "Error al crear canal: {{error}}",
           channelsCacheCleared: 'Cach\xE9 de canales borrado. El pr\xF3ximo "Explorar mis canales" lo descargar\xE1 de nuevo.',
           folderHasNoNotes: "La carpeta no contiene notas `.md`.",
+          folderMissingLinkedChannel: "Esta carpeta todav\xEDa no est\xE1 vinculada a un \xFAnico canal de Are.na.",
           folderAlreadyLinkedChannel: "Esta carpeta ya est\xE1 vinculada a /{{channel}}. Se reutilizar\xE1 ese canal en vez de crear otro.",
           folderLinkedChannelDeleted: "El canal vinculado /{{channel}} ya no existe en Are.na. Se crear\xE1 uno nuevo.",
           creatingChannel: 'Creando canal "{{title}}"\u2026',
@@ -1388,6 +1394,38 @@ var require_plugin = __commonJS({
         this.recordChannelFolder(slug, resolved);
         return resolved;
       }
+      getChannelIdentifier(channel, fallback = "") {
+        const identifier = channel?.slug || channel?.id || fallback;
+        return String(identifier || "").trim();
+      }
+      isNumericChannelIdentifier(identifier) {
+        return /^\d+$/.test(String(identifier || "").trim());
+      }
+      findSelectableChannelByIdentifier(identifier, channels = null) {
+        const target = String(identifier || "").trim();
+        if (!target) return null;
+        const list = Array.isArray(channels) ? channels : Array.isArray(this.settings.channelsCache) ? this.settings.channelsCache : [];
+        return list.find((channel) => this.getChannelIdentifier(channel) === target) || null;
+      }
+      async resolveChannelReference(identifier) {
+        const target = String(identifier || "").trim();
+        if (!target) return null;
+        const cached = this.findSelectableChannelByIdentifier(target);
+        if (cached) return cached;
+        if (this.settings.username) {
+          let state = await this.getSelectableChannels();
+          let found = this.findSelectableChannelByIdentifier(target, state.channels);
+          while (!found && state.hasMore) {
+            state = await this.loadMoreSelectableChannels();
+            found = this.findSelectableChannelByIdentifier(target, state.channels);
+          }
+          if (found) return found;
+        }
+        if (!this.isNumericChannelIdentifier(target)) {
+          return this.getArenaJson(`/channels/${target}`);
+        }
+        return null;
+      }
       async getSelectableChannels() {
         if (!this.settings.username) return { channels: [], total: 0, hasMore: false };
         const current = Array.isArray(this.settings.channelsCache) ? this.settings.channelsCache : [];
@@ -1512,9 +1550,9 @@ var require_plugin = __commonJS({
       }
       updateChannelsCacheEntry(channel) {
         if (!channel) return;
-        const channelKey = String(channel.id || channel.slug || "");
+        const channelKey = this.getChannelIdentifier(channel);
         const current = Array.isArray(this.settings.channelsCache) ? this.settings.channelsCache : [];
-        const next = current.filter((item) => String(item.id || item.slug || "") !== channelKey);
+        const next = current.filter((item) => this.getChannelIdentifier(item) !== channelKey);
         next.unshift(channel);
         this.settings.channelsCache = next;
         const state = this.getChannelBrowserState();
@@ -1535,24 +1573,26 @@ var require_plugin = __commonJS({
         this.cacheDirty = true;
       }
       trackChannelMutation(channel) {
-        const channelSlug = channel?.slug;
-        if (channelSlug) {
-          this.setArenaJsonCache(`/channels/${channelSlug}`, {}, channel);
-          this.invalidateArenaCache([`/channels/${channelSlug}/contents`]);
+        const channelIdentifier = this.getChannelIdentifier(channel);
+        if (channel?.slug) {
+          this.setArenaJsonCache(`/channels/${channel.slug}`, {}, channel);
+        }
+        if (channelIdentifier) {
+          this.invalidateArenaCache([`/channels/${channelIdentifier}/contents`]);
         }
         this.invalidateUserChannelCaches(false);
         this.updateChannelsCacheEntry(channel);
       }
-      forgetDeletedChannel(channelSlug, folderPath = "") {
-        const slug = String(channelSlug || "").trim();
-        if (!slug) return;
-        this.forgetChannelFolder(slug, folderPath);
+      forgetDeletedChannel(channelIdentifier, folderPath = "") {
+        const identifier = String(channelIdentifier || "").trim();
+        if (!identifier) return;
+        this.forgetChannelFolder(identifier, folderPath);
         this.invalidateArenaCache([
-          `/channels/${slug}`,
-          `/channels/${slug}/contents`
+          `/channels/${identifier}`,
+          `/channels/${identifier}/contents`
         ]);
         if (Array.isArray(this.settings.channelsCache)) {
-          this.settings.channelsCache = this.settings.channelsCache.filter((channel) => channel?.slug !== slug);
+          this.settings.channelsCache = this.settings.channelsCache.filter((channel) => this.getChannelIdentifier(channel) !== identifier);
         }
         this.resetChannelBrowserState(true);
         this.cacheDirty = true;
@@ -1560,14 +1600,14 @@ var require_plugin = __commonJS({
       isArenaNotFoundError(error) {
         return Number(error?.status || error?.payload?.code || 0) === 404;
       }
-      trackBlockMutation(block, channelSlug = "") {
+      trackBlockMutation(block, channelIdentifier = "") {
         if (block?.id != null) {
           this.setArenaJsonCache(`/blocks/${block.id}`, {}, block);
         }
-        if (channelSlug) {
+        if (channelIdentifier) {
           this.invalidateArenaCache([
-            `/channels/${channelSlug}`,
-            `/channels/${channelSlug}/contents`
+            `/channels/${channelIdentifier}`,
+            `/channels/${channelIdentifier}/contents`
           ]);
         }
       }
@@ -1626,7 +1666,7 @@ var require_plugin = __commonJS({
             state.exhausted = true;
             return this.buildSelectableChannelsResult(channels);
           }
-          const seen = new Set(channels.map((channel) => String(channel.id || channel.slug || "")));
+          const seen = new Set(channels.map((channel) => this.getChannelIdentifier(channel)));
           let added = 0;
           let scannedPages = 0;
           while (added < batchSize && scannedPages < ARENA_MAX_PAGES_PER_RUN) {
@@ -1638,7 +1678,7 @@ var require_plugin = __commonJS({
             scannedPages++;
             const items = (data.data || []).filter((item) => item.type === "Channel");
             for (const channel of items) {
-              const key = String(channel.id || channel.slug || "");
+              const key = this.getChannelIdentifier(channel);
               if (!key || seen.has(key)) continue;
               seen.add(key);
               channels.push(channel);
@@ -1742,6 +1782,20 @@ var require_plugin = __commonJS({
           const raw = await this.app.vault.cachedRead(file);
           const frontmatter = this.getFileFrontmatter(file, raw);
           if (frontmatter.channel) noteSlugs.add(String(frontmatter.channel).trim());
+        }
+        return noteSlugs.size === 1 ? [...noteSlugs][0] : "";
+      }
+      getFolderLinkedChannelSlugFromCache(folder, files = null) {
+        const folderPath = normalizePath(folder?.path || "");
+        if (!folderPath) return "";
+        const mappedSlugs = Object.entries(this.getChannelFolderMappings()).filter(([, path]) => normalizePath(path || "") === folderPath).map(([slug]) => String(slug || "").trim()).filter(Boolean);
+        if (mappedSlugs.length === 1) return mappedSlugs[0];
+        const noteFiles = Array.isArray(files) ? files : folder.children.filter((file) => file instanceof TFile && file.extension === "md");
+        const noteSlugs = /* @__PURE__ */ new Set();
+        for (const file of noteFiles) {
+          const cached = this.app.metadataCache.getFileCache(file)?.frontmatter;
+          if (!cached?.channel) continue;
+          noteSlugs.add(String(cached.channel).trim());
         }
         return noteSlugs.size === 1 ? [...noteSlugs][0] : "";
       }
@@ -1977,7 +2031,8 @@ var require_plugin = __commonJS({
         const progressNotice = notice || new Notice(this.t("notices.uploadingNotesProgress", { uploaded: 0, total: files.length }), 0);
         const shouldHideNotice = !notice;
         try {
-          if (folder.path && channel.slug) this.recordChannelFolder(channel.slug, folder.path);
+          const channelIdentifier = this.getChannelIdentifier(channel);
+          if (folder.path && channelIdentifier) this.recordChannelFolder(channelIdentifier, folder.path);
           const channelRef = channel.id || channel.slug;
           let uploaded = 0;
           let skipped = 0;
@@ -1990,9 +2045,9 @@ var require_plugin = __commonJS({
             }
             const { content: publishBody } = this.prepareBodyForArena(body);
             let block = null;
-            const currentChannelSlug = String(channel.slug || channelRef || "").trim();
+            const currentChannelIdentifier = String(channelIdentifier || channelRef || "").trim();
             const noteChannelSlug = String(frontmatter.channel || "").trim();
-            const canReuseRemoteBlock = !forceRepublishAll && frontmatter.blockid && (!noteChannelSlug || noteChannelSlug === currentChannelSlug);
+            const canReuseRemoteBlock = !forceRepublishAll && frontmatter.blockid && (!noteChannelSlug || noteChannelSlug === currentChannelIdentifier);
             if (canReuseRemoteBlock) {
               try {
                 block = await this.arena.updateBlock(frontmatter.blockid, publishBody, frontmatter.title || file.basename);
@@ -2003,8 +2058,8 @@ var require_plugin = __commonJS({
             if (!block) {
               block = await this.arena.pushBlock(channelRef, publishBody, file.basename);
             }
-            this.trackBlockMutation(block, channel.slug);
-            await this.mergeArenaFrontmatter(file, block, channel.slug, frontmatter);
+            this.trackBlockMutation(block, channelIdentifier);
+            await this.mergeArenaFrontmatter(file, block, channelIdentifier, frontmatter);
             uploaded++;
           }
           const summary = skipped > 0 ? this.t("notices.folderUploadSummarySkipped", {
@@ -2081,9 +2136,28 @@ var require_plugin = __commonJS({
       registerFolderMenu() {
         this.registerEvent(
           this.app.workspace.on("file-menu", (menu, file) => {
-            if (!(file instanceof TFolder)) return;
+            if (file instanceof TFolder) {
+              const markdownFiles = file.children.filter((child) => child instanceof TFile && child.extension === "md");
+              const linkedChannelSlug = this.getFolderLinkedChannelSlugFromCache(file, markdownFiles);
+              menu.addItem((item) => {
+                item.setTitle(this.t("commands.syncFolderWithChannel")).setIcon("upload").onClick(() => this.cmdUploadFolderAsChannel(file));
+              });
+              if (linkedChannelSlug) {
+                menu.addItem((item) => {
+                  item.setTitle(this.t("commands.updateFolderFromChannel")).setIcon("download").onClick(() => this.cmdPullFolderFromChannel(file));
+                });
+              }
+              return;
+            }
+            if (!(file instanceof TFile) || file.extension !== "md") return;
             menu.addItem((item) => {
-              item.setTitle(this.t("commands.uploadFolderAsChannel")).setIcon("upload").onClick(() => this.cmdUploadFolderAsChannel(file));
+              item.setTitle(this.t("commands.pullBlock")).setIcon("download").onClick(() => this.cmdPullBlock(file));
+            });
+            menu.addItem((item) => {
+              item.setTitle(this.t("commands.pushNote")).setIcon("upload").onClick(() => this.cmdPushNote(file));
+            });
+            menu.addItem((item) => {
+              item.setTitle(this.t("commands.openBlockInArena")).setIcon("external-link").onClick(() => this.cmdOpenInArena(file));
             });
           })
         );
@@ -2114,7 +2188,7 @@ var require_plugin = __commonJS({
             return;
           }
           new ChannelSelectModal(this.app, channelState.channels, async (channel) => {
-            await this.fetchAndSaveChannel(channel.slug);
+            await this.fetchAndSaveChannel(this.getChannelIdentifier(channel), { channel });
           }, {
             t: this.t,
             hasMore: channelState.hasMore,
@@ -2157,11 +2231,17 @@ var require_plugin = __commonJS({
           new Notice(this.t("notices.folderHasNoNotes"));
           return;
         }
-        const linkedChannelSlug = await this.getFolderLinkedChannelSlug(folder, files);
-        if (linkedChannelSlug) {
+        const linkedChannelIdentifier = await this.getFolderLinkedChannelSlug(folder, files);
+        if (linkedChannelIdentifier) {
           try {
-            const existingChannel = await this.getArenaJson(`/channels/${linkedChannelSlug}`);
-            new Notice(this.t("notices.folderAlreadyLinkedChannel", { channel: linkedChannelSlug }));
+            let existingChannel = await this.resolveChannelReference(linkedChannelIdentifier);
+            if (!existingChannel && this.isNumericChannelIdentifier(linkedChannelIdentifier)) {
+              existingChannel = { id: Number(linkedChannelIdentifier), title: linkedChannelIdentifier };
+            }
+            if (!existingChannel) {
+              throw Object.assign(new Error(`Channel ${linkedChannelIdentifier} not found`), { status: 404 });
+            }
+            new Notice(this.t("notices.folderAlreadyLinkedChannel", { channel: linkedChannelIdentifier }));
             await this.syncFolderToChannel(folder, files, existingChannel);
             await this.persistData();
             return;
@@ -2170,9 +2250,9 @@ var require_plugin = __commonJS({
               new Notice(this.t("notices.genericError", { error: error.message }));
               return;
             }
-            this.forgetDeletedChannel(linkedChannelSlug, folder.path);
+            this.forgetDeletedChannel(linkedChannelIdentifier, folder.path);
             await this.persistData();
-            new Notice(this.t("notices.folderLinkedChannelDeleted", { channel: linkedChannelSlug }));
+            new Notice(this.t("notices.folderLinkedChannelDeleted", { channel: linkedChannelIdentifier }));
           }
         }
         new CreateChannelModal(this.app, async (title, visibility) => {
@@ -2181,7 +2261,7 @@ var require_plugin = __commonJS({
             const channel = await this.arena.createChannel(title, visibility);
             this.trackChannelMutation(channel);
             await this.syncFolderToChannel(folder, files, channel, {
-              forceRepublishAll: Boolean(linkedChannelSlug),
+              forceRepublishAll: Boolean(linkedChannelIdentifier),
               notice
             });
             notice.hide();
@@ -2192,8 +2272,21 @@ var require_plugin = __commonJS({
           }
         }, folder.name, { t: this.t }).open();
       }
-      async cmdPullBlock() {
-        const file = this.app.workspace.getActiveFile();
+      async cmdPullFolderFromChannel(folder) {
+        if (!this.checkSettings()) return;
+        const files = folder.children.filter((file) => file instanceof TFile && file.extension === "md");
+        const linkedChannelIdentifier = await this.getFolderLinkedChannelSlug(folder, files);
+        if (!linkedChannelIdentifier) {
+          new Notice(this.t("notices.folderMissingLinkedChannel"));
+          return;
+        }
+        this.recordChannelFolder(linkedChannelIdentifier, folder.path);
+        const channel = await this.resolveChannelReference(linkedChannelIdentifier);
+        await this.fetchAndSaveChannel(linkedChannelIdentifier, channel ? { channel } : {});
+      }
+      async cmdPullBlock(file = null) {
+        if (!this.checkSettings()) return;
+        file = file || this.app.workspace.getActiveFile();
         if (!file) return;
         const { content, body, frontmatter } = await this.readNoteState(file);
         if (isSyncSkipped(frontmatter)) {
@@ -2229,8 +2322,9 @@ var require_plugin = __commonJS({
           new Notice(this.t("notices.genericError", { error: error.message }));
         }
       }
-      async cmdPushNote() {
-        const file = this.app.workspace.getActiveFile();
+      async cmdPushNote(file = null) {
+        if (!this.checkSettings()) return;
+        file = file || this.app.workspace.getActiveFile();
         if (!file) return;
         const { body, frontmatter } = await this.readNoteState(file);
         if (isSyncSkipped(frontmatter)) {
@@ -2352,38 +2446,43 @@ var require_plugin = __commonJS({
           { submitText: this.t("common.accept") }
         ).open();
       }
-      async cmdOpenInArena() {
-        const file = this.app.workspace.getActiveFile();
+      async cmdOpenInArena(file = null) {
+        file = file || this.app.workspace.getActiveFile();
         if (!file) return;
         const { frontmatter } = await this.readNoteState(file);
         const blockId = frontmatter.blockid;
-        const channel = frontmatter.channel;
+        const channel = String(frontmatter.channel || "").trim();
         if (!blockId) {
           new Notice(this.t("notices.noteMissingBlockId"));
           return;
         }
-        const url = channel ? `https://www.are.na/${this.settings.username}/${channel}/blocks/${blockId}` : `https://www.are.na/block/${blockId}`;
+        const url = channel && this.settings.username && !this.isNumericChannelIdentifier(channel) ? `https://www.are.na/${this.settings.username}/${channel}/blocks/${blockId}` : `https://www.are.na/block/${blockId}`;
         window.open(url, "_blank");
       }
-      async fetchAndSaveChannel(slug) {
-        new Notice(this.t("notices.downloadingChannel", { slug }));
+      async fetchAndSaveChannel(identifier, options = {}) {
+        let channel = options.channel || null;
+        let channelIdentifier = this.getChannelIdentifier(channel, identifier);
+        new Notice(this.t("notices.downloadingChannel", { slug: channel?.title || channelIdentifier }));
         try {
           const transferState = this.createTransferState();
-          const channel = await this.getArenaJson(`/channels/${slug}`);
-          const channelTitle = channel.title || slug;
+          if (!channel && !this.isNumericChannelIdentifier(channelIdentifier)) {
+            channel = await this.resolveChannelReference(channelIdentifier);
+          }
+          channelIdentifier = this.getChannelIdentifier(channel, channelIdentifier);
+          const channelTitle = channel?.title || channelIdentifier;
           const { blockIndex, channelFolders } = await this.buildVaultIndexes();
-          const folder = this.resolveChannelFolder(slug, channelTitle, channelFolders);
+          const folder = this.resolveChannelFolder(channelIdentifier, channelTitle, channelFolders);
           await this.ensureFolder(folder);
           let saved = 0;
           let skippedByFlag = 0;
           let skippedToProtectLocalOnly = 0;
           let page = 1;
           while (true) {
-            const data = await this.getArenaJson(`/channels/${slug}/contents`, { page });
+            const data = await this.getArenaJson(`/channels/${channelIdentifier}/contents`, { page });
             const blocks = data.data || [];
             for (const block of blocks) {
               if (block.type === "Channel") continue;
-              const result = await this.saveBlock(block, slug, folder, blockIndex, transferState);
+              const result = await this.saveBlock(block, channelIdentifier, folder, blockIndex, transferState);
               if (result.written) saved++;
               else if (result.reason === "sync_skip") skippedByFlag++;
               else if (result.reason === "local_publish_only") skippedToProtectLocalOnly++;

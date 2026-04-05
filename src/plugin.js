@@ -198,6 +198,47 @@ class ArenaManagerPlugin extends Plugin {
     return resolved;
   }
 
+  getChannelIdentifier(channel, fallback = "") {
+    const identifier = channel?.slug || channel?.id || fallback;
+    return String(identifier || "").trim();
+  }
+
+  isNumericChannelIdentifier(identifier) {
+    return /^\d+$/.test(String(identifier || "").trim());
+  }
+
+  findSelectableChannelByIdentifier(identifier, channels = null) {
+    const target = String(identifier || "").trim();
+    if (!target) return null;
+
+    const list = Array.isArray(channels) ? channels : (Array.isArray(this.settings.channelsCache) ? this.settings.channelsCache : []);
+    return list.find((channel) => this.getChannelIdentifier(channel) === target) || null;
+  }
+
+  async resolveChannelReference(identifier) {
+    const target = String(identifier || "").trim();
+    if (!target) return null;
+
+    const cached = this.findSelectableChannelByIdentifier(target);
+    if (cached) return cached;
+
+    if (this.settings.username) {
+      let state = await this.getSelectableChannels();
+      let found = this.findSelectableChannelByIdentifier(target, state.channels);
+      while (!found && state.hasMore) {
+        state = await this.loadMoreSelectableChannels();
+        found = this.findSelectableChannelByIdentifier(target, state.channels);
+      }
+      if (found) return found;
+    }
+
+    if (!this.isNumericChannelIdentifier(target)) {
+      return this.getArenaJson(`/channels/${target}`);
+    }
+
+    return null;
+  }
+
   async getSelectableChannels() {
     if (!this.settings.username) return { channels: [], total: 0, hasMore: false };
     const current = Array.isArray(this.settings.channelsCache) ? this.settings.channelsCache : [];
@@ -347,9 +388,9 @@ class ArenaManagerPlugin extends Plugin {
 
   updateChannelsCacheEntry(channel) {
     if (!channel) return;
-    const channelKey = String(channel.id || channel.slug || "");
+    const channelKey = this.getChannelIdentifier(channel);
     const current = Array.isArray(this.settings.channelsCache) ? this.settings.channelsCache : [];
-    const next = current.filter((item) => String(item.id || item.slug || "") !== channelKey);
+    const next = current.filter((item) => this.getChannelIdentifier(item) !== channelKey);
     next.unshift(channel);
     this.settings.channelsCache = next;
     const state = this.getChannelBrowserState();
@@ -372,26 +413,28 @@ class ArenaManagerPlugin extends Plugin {
   }
 
   trackChannelMutation(channel) {
-    const channelSlug = channel?.slug;
-    if (channelSlug) {
-      this.setArenaJsonCache(`/channels/${channelSlug}`, {}, channel);
-      this.invalidateArenaCache([`/channels/${channelSlug}/contents`]);
+    const channelIdentifier = this.getChannelIdentifier(channel);
+    if (channel?.slug) {
+      this.setArenaJsonCache(`/channels/${channel.slug}`, {}, channel);
+    }
+    if (channelIdentifier) {
+      this.invalidateArenaCache([`/channels/${channelIdentifier}/contents`]);
     }
     this.invalidateUserChannelCaches(false);
     this.updateChannelsCacheEntry(channel);
   }
 
-  forgetDeletedChannel(channelSlug, folderPath = "") {
-    const slug = String(channelSlug || "").trim();
-    if (!slug) return;
+  forgetDeletedChannel(channelIdentifier, folderPath = "") {
+    const identifier = String(channelIdentifier || "").trim();
+    if (!identifier) return;
 
-    this.forgetChannelFolder(slug, folderPath);
+    this.forgetChannelFolder(identifier, folderPath);
     this.invalidateArenaCache([
-      `/channels/${slug}`,
-      `/channels/${slug}/contents`,
+      `/channels/${identifier}`,
+      `/channels/${identifier}/contents`,
     ]);
     if (Array.isArray(this.settings.channelsCache)) {
-      this.settings.channelsCache = this.settings.channelsCache.filter((channel) => channel?.slug !== slug);
+      this.settings.channelsCache = this.settings.channelsCache.filter((channel) => this.getChannelIdentifier(channel) !== identifier);
     }
     this.resetChannelBrowserState(true);
     this.cacheDirty = true;
@@ -401,14 +444,14 @@ class ArenaManagerPlugin extends Plugin {
     return Number(error?.status || error?.payload?.code || 0) === 404;
   }
 
-  trackBlockMutation(block, channelSlug = "") {
+  trackBlockMutation(block, channelIdentifier = "") {
     if (block?.id != null) {
       this.setArenaJsonCache(`/blocks/${block.id}`, {}, block);
     }
-    if (channelSlug) {
+    if (channelIdentifier) {
       this.invalidateArenaCache([
-        `/channels/${channelSlug}`,
-        `/channels/${channelSlug}/contents`,
+        `/channels/${channelIdentifier}`,
+        `/channels/${channelIdentifier}/contents`,
       ]);
     }
   }
@@ -478,7 +521,7 @@ class ArenaManagerPlugin extends Plugin {
         return this.buildSelectableChannelsResult(channels);
       }
 
-      const seen = new Set(channels.map((channel) => String(channel.id || channel.slug || "")));
+      const seen = new Set(channels.map((channel) => this.getChannelIdentifier(channel)));
       let added = 0;
       let scannedPages = 0;
 
@@ -491,7 +534,7 @@ class ArenaManagerPlugin extends Plugin {
         scannedPages++;
         const items = (data.data || []).filter((item) => item.type === "Channel");
         for (const channel of items) {
-          const key = String(channel.id || channel.slug || "");
+          const key = this.getChannelIdentifier(channel);
           if (!key || seen.has(key)) continue;
           seen.add(key);
           channels.push(channel);
@@ -619,6 +662,30 @@ class ArenaManagerPlugin extends Plugin {
       const raw = await this.app.vault.cachedRead(file);
       const frontmatter = this.getFileFrontmatter(file, raw);
       if (frontmatter.channel) noteSlugs.add(String(frontmatter.channel).trim());
+    }
+
+    return noteSlugs.size === 1 ? [...noteSlugs][0] : "";
+  }
+
+  getFolderLinkedChannelSlugFromCache(folder, files = null) {
+    const folderPath = normalizePath(folder?.path || "");
+    if (!folderPath) return "";
+
+    const mappedSlugs = Object.entries(this.getChannelFolderMappings())
+      .filter(([, path]) => normalizePath(path || "") === folderPath)
+      .map(([slug]) => String(slug || "").trim())
+      .filter(Boolean);
+    if (mappedSlugs.length === 1) return mappedSlugs[0];
+
+    const noteFiles = Array.isArray(files)
+      ? files
+      : folder.children.filter((file) => file instanceof TFile && file.extension === "md");
+    const noteSlugs = new Set();
+
+    for (const file of noteFiles) {
+      const cached = this.app.metadataCache.getFileCache(file)?.frontmatter;
+      if (!cached?.channel) continue;
+      noteSlugs.add(String(cached.channel).trim());
     }
 
     return noteSlugs.size === 1 ? [...noteSlugs][0] : "";
@@ -895,7 +962,8 @@ class ArenaManagerPlugin extends Plugin {
     const shouldHideNotice = !notice;
 
     try {
-      if (folder.path && channel.slug) this.recordChannelFolder(channel.slug, folder.path);
+      const channelIdentifier = this.getChannelIdentifier(channel);
+      if (folder.path && channelIdentifier) this.recordChannelFolder(channelIdentifier, folder.path);
       const channelRef = channel.id || channel.slug;
       let uploaded = 0;
       let skipped = 0;
@@ -910,9 +978,9 @@ class ArenaManagerPlugin extends Plugin {
         const { content: publishBody } = this.prepareBodyForArena(body);
 
         let block = null;
-        const currentChannelSlug = String(channel.slug || channelRef || "").trim();
+        const currentChannelIdentifier = String(channelIdentifier || channelRef || "").trim();
         const noteChannelSlug = String(frontmatter.channel || "").trim();
-        const canReuseRemoteBlock = !forceRepublishAll && frontmatter.blockid && (!noteChannelSlug || noteChannelSlug === currentChannelSlug);
+        const canReuseRemoteBlock = !forceRepublishAll && frontmatter.blockid && (!noteChannelSlug || noteChannelSlug === currentChannelIdentifier);
 
         if (canReuseRemoteBlock) {
           try {
@@ -926,8 +994,8 @@ class ArenaManagerPlugin extends Plugin {
           block = await this.arena.pushBlock(channelRef, publishBody, file.basename);
         }
 
-        this.trackBlockMutation(block, channel.slug);
-        await this.mergeArenaFrontmatter(file, block, channel.slug, frontmatter);
+        this.trackBlockMutation(block, channelIdentifier);
+        await this.mergeArenaFrontmatter(file, block, channelIdentifier, frontmatter);
         uploaded++;
       }
 
@@ -1009,12 +1077,47 @@ class ArenaManagerPlugin extends Plugin {
   registerFolderMenu() {
     this.registerEvent(
       this.app.workspace.on("file-menu", (menu, file) => {
-        if (!(file instanceof TFolder)) return;
+        if (file instanceof TFolder) {
+          const markdownFiles = file.children.filter((child) => child instanceof TFile && child.extension === "md");
+          const linkedChannelSlug = this.getFolderLinkedChannelSlugFromCache(file, markdownFiles);
+
+          menu.addItem((item) => {
+            item
+              .setTitle(this.t("commands.syncFolderWithChannel"))
+              .setIcon("upload")
+              .onClick(() => this.cmdUploadFolderAsChannel(file));
+          });
+
+          if (linkedChannelSlug) {
+            menu.addItem((item) => {
+              item
+                .setTitle(this.t("commands.updateFolderFromChannel"))
+                .setIcon("download")
+                .onClick(() => this.cmdPullFolderFromChannel(file));
+            });
+          }
+          return;
+        }
+
+        if (!(file instanceof TFile) || file.extension !== "md") return;
+
         menu.addItem((item) => {
           item
-            .setTitle(this.t("commands.uploadFolderAsChannel"))
+            .setTitle(this.t("commands.pullBlock"))
+            .setIcon("download")
+            .onClick(() => this.cmdPullBlock(file));
+        });
+        menu.addItem((item) => {
+          item
+            .setTitle(this.t("commands.pushNote"))
             .setIcon("upload")
-            .onClick(() => this.cmdUploadFolderAsChannel(file));
+            .onClick(() => this.cmdPushNote(file));
+        });
+        menu.addItem((item) => {
+          item
+            .setTitle(this.t("commands.openBlockInArena"))
+            .setIcon("external-link")
+            .onClick(() => this.cmdOpenInArena(file));
         });
       })
     );
@@ -1047,7 +1150,7 @@ class ArenaManagerPlugin extends Plugin {
         return;
       }
       new ChannelSelectModal(this.app, channelState.channels, async (channel) => {
-        await this.fetchAndSaveChannel(channel.slug);
+        await this.fetchAndSaveChannel(this.getChannelIdentifier(channel), { channel });
       }, {
         t: this.t,
         hasMore: channelState.hasMore,
@@ -1093,11 +1196,17 @@ class ArenaManagerPlugin extends Plugin {
       new Notice(this.t("notices.folderHasNoNotes"));
       return;
     }
-    const linkedChannelSlug = await this.getFolderLinkedChannelSlug(folder, files);
-    if (linkedChannelSlug) {
+    const linkedChannelIdentifier = await this.getFolderLinkedChannelSlug(folder, files);
+    if (linkedChannelIdentifier) {
       try {
-        const existingChannel = await this.getArenaJson(`/channels/${linkedChannelSlug}`);
-        new Notice(this.t("notices.folderAlreadyLinkedChannel", { channel: linkedChannelSlug }));
+        let existingChannel = await this.resolveChannelReference(linkedChannelIdentifier);
+        if (!existingChannel && this.isNumericChannelIdentifier(linkedChannelIdentifier)) {
+          existingChannel = { id: Number(linkedChannelIdentifier), title: linkedChannelIdentifier };
+        }
+        if (!existingChannel) {
+          throw Object.assign(new Error(`Channel ${linkedChannelIdentifier} not found`), { status: 404 });
+        }
+        new Notice(this.t("notices.folderAlreadyLinkedChannel", { channel: linkedChannelIdentifier }));
         await this.syncFolderToChannel(folder, files, existingChannel);
         await this.persistData();
         return;
@@ -1106,9 +1215,9 @@ class ArenaManagerPlugin extends Plugin {
           new Notice(this.t("notices.genericError", { error: error.message }));
           return;
         }
-        this.forgetDeletedChannel(linkedChannelSlug, folder.path);
+        this.forgetDeletedChannel(linkedChannelIdentifier, folder.path);
         await this.persistData();
-        new Notice(this.t("notices.folderLinkedChannelDeleted", { channel: linkedChannelSlug }));
+        new Notice(this.t("notices.folderLinkedChannelDeleted", { channel: linkedChannelIdentifier }));
       }
     }
 
@@ -1118,7 +1227,7 @@ class ArenaManagerPlugin extends Plugin {
         const channel = await this.arena.createChannel(title, visibility);
         this.trackChannelMutation(channel);
         await this.syncFolderToChannel(folder, files, channel, {
-          forceRepublishAll: Boolean(linkedChannelSlug),
+          forceRepublishAll: Boolean(linkedChannelIdentifier),
           notice,
         });
         notice.hide();
@@ -1130,8 +1239,23 @@ class ArenaManagerPlugin extends Plugin {
     }, folder.name, { t: this.t }).open();
   }
 
-  async cmdPullBlock() {
-    const file = this.app.workspace.getActiveFile();
+  async cmdPullFolderFromChannel(folder) {
+    if (!this.checkSettings()) return;
+    const files = folder.children.filter((file) => file instanceof TFile && file.extension === "md");
+    const linkedChannelIdentifier = await this.getFolderLinkedChannelSlug(folder, files);
+    if (!linkedChannelIdentifier) {
+      new Notice(this.t("notices.folderMissingLinkedChannel"));
+      return;
+    }
+
+    this.recordChannelFolder(linkedChannelIdentifier, folder.path);
+    const channel = await this.resolveChannelReference(linkedChannelIdentifier);
+    await this.fetchAndSaveChannel(linkedChannelIdentifier, channel ? { channel } : {});
+  }
+
+  async cmdPullBlock(file = null) {
+    if (!this.checkSettings()) return;
+    file = file || this.app.workspace.getActiveFile();
     if (!file) return;
     const { content, body, frontmatter } = await this.readNoteState(file);
     if (isSyncSkipped(frontmatter)) {
@@ -1168,8 +1292,9 @@ class ArenaManagerPlugin extends Plugin {
     }
   }
 
-  async cmdPushNote() {
-    const file = this.app.workspace.getActiveFile();
+  async cmdPushNote(file = null) {
+    if (!this.checkSettings()) return;
+    file = file || this.app.workspace.getActiveFile();
     if (!file) return;
     const { body, frontmatter } = await this.readNoteState(file);
     if (isSyncSkipped(frontmatter)) {
@@ -1297,30 +1422,35 @@ class ArenaManagerPlugin extends Plugin {
     ).open();
   }
 
-  async cmdOpenInArena() {
-    const file = this.app.workspace.getActiveFile();
+  async cmdOpenInArena(file = null) {
+    file = file || this.app.workspace.getActiveFile();
     if (!file) return;
     const { frontmatter } = await this.readNoteState(file);
     const blockId = frontmatter.blockid;
-    const channel = frontmatter.channel;
+    const channel = String(frontmatter.channel || "").trim();
     if (!blockId) {
       new Notice(this.t("notices.noteMissingBlockId"));
       return;
     }
-    const url = channel
+    const url = channel && this.settings.username && !this.isNumericChannelIdentifier(channel)
       ? `https://www.are.na/${this.settings.username}/${channel}/blocks/${blockId}`
       : `https://www.are.na/block/${blockId}`;
     window.open(url, "_blank");
   }
 
-  async fetchAndSaveChannel(slug) {
-    new Notice(this.t("notices.downloadingChannel", { slug }));
+  async fetchAndSaveChannel(identifier, options = {}) {
+    let channel = options.channel || null;
+    let channelIdentifier = this.getChannelIdentifier(channel, identifier);
+    new Notice(this.t("notices.downloadingChannel", { slug: channel?.title || channelIdentifier }));
     try {
       const transferState = this.createTransferState();
-      const channel = await this.getArenaJson(`/channels/${slug}`);
-      const channelTitle = channel.title || slug;
+      if (!channel && !this.isNumericChannelIdentifier(channelIdentifier)) {
+        channel = await this.resolveChannelReference(channelIdentifier);
+      }
+      channelIdentifier = this.getChannelIdentifier(channel, channelIdentifier);
+      const channelTitle = channel?.title || channelIdentifier;
       const { blockIndex, channelFolders } = await this.buildVaultIndexes();
-      const folder = this.resolveChannelFolder(slug, channelTitle, channelFolders);
+      const folder = this.resolveChannelFolder(channelIdentifier, channelTitle, channelFolders);
       await this.ensureFolder(folder);
       let saved = 0;
       let skippedByFlag = 0;
@@ -1328,12 +1458,12 @@ class ArenaManagerPlugin extends Plugin {
       let page = 1;
 
       while (true) {
-        const data = await this.getArenaJson(`/channels/${slug}/contents`, { page });
+        const data = await this.getArenaJson(`/channels/${channelIdentifier}/contents`, { page });
         const blocks = data.data || [];
 
         for (const block of blocks) {
           if (block.type === "Channel") continue;
-          const result = await this.saveBlock(block, slug, folder, blockIndex, transferState);
+          const result = await this.saveBlock(block, channelIdentifier, folder, blockIndex, transferState);
           if (result.written) saved++;
           else if (result.reason === "sync_skip") skippedByFlag++;
           else if (result.reason === "local_publish_only") skippedToProtectLocalOnly++;
