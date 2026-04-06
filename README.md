@@ -19,7 +19,9 @@ This plugin was built out of my own need to keep an Obsidian vault and Are.na wo
 
 ## Status
 
-Current version: `1.0.1-beta.2`
+Current version: `1.0.1-beta.3`
+
+On mobile, if the file explorer context menu does not expose plugin items reliably, use the Command Palette actions for the current note and the current note folder as a fallback.
 
 This version uses the Are.na `v3` API with a Personal Access Token.
 

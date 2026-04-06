@@ -1035,6 +1035,28 @@ class ArenaManagerPlugin extends Plugin {
       callback: () => this.cmdRefreshChannelsCache(),
     });
     this.addCommand({
+      id: "sync-current-note-folder-with-channel",
+      name: this.t("commands.syncCurrentNoteFolderWithChannel"),
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile();
+        if (file?.parent instanceof TFolder) {
+          if (!checking) this.cmdUploadFolderAsChannel(file.parent);
+          return true;
+        }
+      },
+    });
+    this.addCommand({
+      id: "update-current-note-folder-from-channel",
+      name: this.t("commands.updateCurrentNoteFolderFromChannel"),
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile();
+        if (file?.parent instanceof TFolder) {
+          if (!checking) this.cmdPullFolderFromChannel(file.parent);
+          return true;
+        }
+      },
+    });
+    this.addCommand({
       id: "pull-block",
       name: this.t("commands.pullBlock"),
       checkCallback: (checking) => {

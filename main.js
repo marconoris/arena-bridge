@@ -660,6 +660,8 @@ var require_i18n = __commonJS({
           refreshChannelsCache: "Refresh channels list",
           syncFolderWithChannel: "Sync folder with Are.na channel",
           updateFolderFromChannel: "Update folder from linked Are.na channel",
+          syncCurrentNoteFolderWithChannel: "Sync current note folder with Are.na channel",
+          updateCurrentNoteFolderFromChannel: "Update current note folder from linked Are.na channel",
           pullBlock: "Update note from Are.na (Pull)",
           pushNote: "Send note to Are.na (Push)",
           getBlockById: "Get block by ID or URL",
@@ -677,7 +679,7 @@ var require_i18n = __commonJS({
           manualSlugInput: "Enter slug manually"
         },
         notices: {
-          pluginLoaded: "Are.na Bridge v1.0.1-beta.2 loaded.",
+          pluginLoaded: "Are.na Bridge v1.0.1-beta.3 loaded.",
           pluginUnloaded: "Are.na Bridge unloaded.",
           loadingYourChannels: "Loading your channels\u2026",
           loadingChannelsPage: "Loading channels\u2026 page {{page}} \xB7 {{total}} found",
@@ -818,6 +820,8 @@ var require_i18n = __commonJS({
           refreshChannelsCache: "Actualizar lista de canales (refresco)",
           syncFolderWithChannel: "Sincronizar carpeta con canal de Are.na",
           updateFolderFromChannel: "Actualizar carpeta desde el canal vinculado de Are.na",
+          syncCurrentNoteFolderWithChannel: "Sincronizar la carpeta de la nota actual con Are.na",
+          updateCurrentNoteFolderFromChannel: "Actualizar la carpeta de la nota actual desde Are.na",
           pullBlock: "Actualizar nota desde Are.na (Pull)",
           pushNote: "Enviar nota a Are.na (Push)",
           getBlockById: "Obtener bloque por ID o URL",
@@ -835,7 +839,7 @@ var require_i18n = __commonJS({
           manualSlugInput: "Introducir slug manual"
         },
         notices: {
-          pluginLoaded: "Are.na Bridge v1.0.1-beta.2 cargado.",
+          pluginLoaded: "Are.na Bridge v1.0.1-beta.3 cargado.",
           pluginUnloaded: "Are.na Bridge descargado.",
           loadingYourChannels: "Cargando tus canales\u2026",
           loadingChannelsPage: "Cargando canales\u2026 p\xE1g. {{page}} \xB7 {{total}} encontrados",
@@ -2093,6 +2097,28 @@ var require_plugin = __commonJS({
           id: "refresh-channels-cache",
           name: this.t("commands.refreshChannelsCache"),
           callback: () => this.cmdRefreshChannelsCache()
+        });
+        this.addCommand({
+          id: "sync-current-note-folder-with-channel",
+          name: this.t("commands.syncCurrentNoteFolderWithChannel"),
+          checkCallback: (checking) => {
+            const file = this.app.workspace.getActiveFile();
+            if (file?.parent instanceof TFolder) {
+              if (!checking) this.cmdUploadFolderAsChannel(file.parent);
+              return true;
+            }
+          }
+        });
+        this.addCommand({
+          id: "update-current-note-folder-from-channel",
+          name: this.t("commands.updateCurrentNoteFolderFromChannel"),
+          checkCallback: (checking) => {
+            const file = this.app.workspace.getActiveFile();
+            if (file?.parent instanceof TFolder) {
+              if (!checking) this.cmdPullFolderFromChannel(file.parent);
+              return true;
+            }
+          }
         });
         this.addCommand({
           id: "pull-block",
